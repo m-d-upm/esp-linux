@@ -1,0 +1,523 @@
+diff -urpN a/drivers/net/ethernet/aeroflex/greth.c b/drivers/net/ethernet/aeroflex/greth.c
+--- a/drivers/net/ethernet/aeroflex/greth.c	2026-01-19 13:10:20.000000000 +0100
++++ b/drivers/net/ethernet/aeroflex/greth.c	2026-02-27 10:48:30.289561539 +0100
+@@ -36,6 +36,9 @@
+ #include <asm/cacheflush.h>
+ #include <asm/byteorder.h>
+ 
++#include <linux/of_irq.h>
++#include <linux/of_reserved_mem.h>
++
+ #ifdef CONFIG_SPARC
+ #include <asm/idprom.h>
+ #endif
+@@ -78,8 +81,8 @@ static int greth_close(struct net_device
+ static int greth_set_mac_add(struct net_device *dev, void *p);
+ static void greth_set_multicast_list(struct net_device *dev);
+ 
+-#define GRETH_REGLOAD(a)	    (be32_to_cpu(__raw_readl(&(a))))
+-#define GRETH_REGSAVE(a, v)         (__raw_writel(cpu_to_be32(v), &(a)))
++#define GRETH_REGLOAD(a)	    	(__raw_readl(&(a)))
++#define GRETH_REGSAVE(a, v)         (__raw_writel(v, &(a)))
+ #define GRETH_REGORIN(a, v)         (GRETH_REGSAVE(a, (GRETH_REGLOAD(a) | (v))))
+ #define GRETH_REGANDIN(a, v)        (GRETH_REGSAVE(a, (GRETH_REGLOAD(a) & (v))))
+ 
+@@ -154,12 +157,12 @@ static inline void greth_disable_irqs(st
+ 
+ static inline void greth_write_bd(u32 *bd, u32 val)
+ {
+-	__raw_writel(cpu_to_be32(val), bd);
++	__raw_writel(val, bd);
+ }
+ 
+ static inline u32 greth_read_bd(u32 *bd)
+ {
+-	return be32_to_cpu(__raw_readl(bd));
++	return __raw_readl(bd);
+ }
+ 
+ static void greth_clean_rings(struct greth_private *greth)
+@@ -212,6 +215,17 @@ static void greth_clean_rings(struct gre
+ 
+ 	} else { /* 10/100 Mbps MAC */
+ 
++		for (i = 0; i < GRETH_RXBD_NUM; i++, rx_bdp++)
++			dma_free_coherent(greth->dev, MAX_FRAME_SIZE,
++					greth->rx_bufs[i],
++					greth_read_bd(&rx_bdp->addr));
++
++		for (i = 0; i < GRETH_TXBD_NUM; i++, tx_bdp++)
++			dma_free_coherent(greth->dev, MAX_FRAME_SIZE,
++					greth->tx_bufs[i],
++					greth_read_bd(&tx_bdp->addr));
++
++		/*
+ 		for (i = 0; i < GRETH_RXBD_NUM; i++, rx_bdp++) {
+ 			kfree(greth->rx_bufs[i]);
+ 			dma_unmap_single(greth->dev,
+@@ -226,6 +240,7 @@ static void greth_clean_rings(struct gre
+ 					 MAX_FRAME_SIZE,
+ 					 DMA_TO_DEVICE);
+ 		}
++		*/
+ 	}
+ }
+ 
+@@ -233,7 +248,7 @@ static int greth_init_rings(struct greth
+ {
+ 	struct sk_buff *skb;
+ 	struct greth_bd *rx_bd, *tx_bd;
+-	u32 dma_addr;
++	dma_addr_t dma_addr;
+ 	int i;
+ 
+ 	rx_bd = greth->rx_bd_base;
+@@ -271,14 +286,18 @@ static int greth_init_rings(struct greth
+ 		/* 10/100 MAC uses a fixed set of buffers and copy to/from SKBs */
+ 		for (i = 0; i < GRETH_RXBD_NUM; i++) {
+ 
+-			greth->rx_bufs[i] = kmalloc(MAX_FRAME_SIZE, GFP_KERNEL);
++			//greth->rx_bufs[i] = kmalloc(MAX_FRAME_SIZE, GFP_KERNEL);
++
++			greth->rx_bufs[i] = dma_alloc_coherent(greth->dev, MAX_FRAME_SIZE,
++							(dma_addr_t *) &dma_addr,
++							GFP_KERNEL);
+ 
+ 			if (greth->rx_bufs[i] == NULL) {
+ 				if (netif_msg_ifup(greth))
+ 					dev_err(greth->dev, "Error allocating DMA ring.\n");
+ 				goto cleanup;
+ 			}
+-
++			/*
+ 			dma_addr = dma_map_single(greth->dev,
+ 						  greth->rx_bufs[i],
+ 						  MAX_FRAME_SIZE,
+@@ -289,12 +308,17 @@ static int greth_init_rings(struct greth
+ 					dev_err(greth->dev, "Could not create initial DMA mapping\n");
+ 				goto cleanup;
+ 			}
++			*/
+ 			greth_write_bd(&rx_bd[i].addr, dma_addr);
+ 			greth_write_bd(&rx_bd[i].stat, GRETH_BD_EN | GRETH_BD_IE);
+ 		}
+ 		for (i = 0; i < GRETH_TXBD_NUM; i++) {
+ 
+-			greth->tx_bufs[i] = kmalloc(MAX_FRAME_SIZE, GFP_KERNEL);
++			//greth->tx_bufs[i] = kmalloc(MAX_FRAME_SIZE, GFP_KERNEL);
++
++			greth->tx_bufs[i] = dma_alloc_coherent(greth->dev, MAX_FRAME_SIZE,
++							(dma_addr_t *) &dma_addr,
++							GFP_KERNEL);
+ 
+ 			if (greth->tx_bufs[i] == NULL) {
+ 				if (netif_msg_ifup(greth))
+@@ -302,6 +326,7 @@ static int greth_init_rings(struct greth
+ 				goto cleanup;
+ 			}
+ 
++			/*
+ 			dma_addr = dma_map_single(greth->dev,
+ 						  greth->tx_bufs[i],
+ 						  MAX_FRAME_SIZE,
+@@ -312,6 +337,7 @@ static int greth_init_rings(struct greth
+ 					dev_err(greth->dev, "Could not create initial DMA mapping\n");
+ 				goto cleanup;
+ 			}
++			*/
+ 			greth_write_bd(&tx_bd[i].addr, dma_addr);
+ 			greth_write_bd(&tx_bd[i].stat, 0);
+ 		}
+@@ -396,9 +422,18 @@ greth_start_xmit(struct sk_buff *skb, st
+ 	struct greth_private *greth = netdev_priv(dev);
+ 	struct greth_bd *bdp;
+ 	int err = NETDEV_TX_OK;
+-	u32 status, dma_addr, ctrl;
++	//u32 status, dma_addr, ctrl;
++	u32 status, ctrl;
++	dma_addr_t dma_addr;
+ 	unsigned long flags;
+ 
++	int i, j;
++	int len;
++	int len_rest;
++
++	unsigned char* dma_dst;
++	unsigned char* dma_src;
++
+ 	/* Clean TX Ring */
+ 	greth_clean_tx(greth->netdev);
+ 
+@@ -425,8 +460,30 @@ greth_start_xmit(struct sk_buff *skb, st
+ 	bdp = greth->tx_bd_base + greth->tx_next;
+ 	dma_addr = greth_read_bd(&bdp->addr);
+ 
+-	memcpy((unsigned char *) phys_to_virt(dma_addr), skb->data, skb->len);
+-
++	//memcpy((unsigned char *) phys_to_virt(dma_addr), skb->data, skb->len);
++	//memcpy(greth->tx_bufs[greth->tx_next], skb->data, skb->len);
++	
++	/* Workaround to fix little vs. big endian */
++	dma_dst = (unsigned char *) greth->tx_bufs[greth->tx_next];
++	dma_src = (unsigned char *) skb->data;
++
++	//pr_info("greth_start_xmit skb->len = %d bytes\n", skb->len);
++
++	len = skb->len >> 2;
++	len_rest = skb->len - (len << 2);
++
++	for (i = 0; i < len; i++)
++		for (j = 0; j < 4; j++)
++			dma_dst[(i << 2) + j] = dma_src[(i << 2) + 3 - j];
++
++	if(len_rest > 0) {
++		for (j = 0; j < 4; j++)
++			if(j < len_rest)
++				dma_dst[(len << 2) + 3 - j] = dma_src[(len << 2) + j];
++			else
++				dma_dst[(len << 2) + 3 - j] = 0;
++	}
++		
+ 	dma_sync_single_for_device(greth->dev, dma_addr, skb->len, DMA_TO_DEVICE);
+ 
+ 	status = GRETH_BD_EN | GRETH_BD_IE | (skb->len & GRETH_BD_LEN);
+@@ -464,7 +521,9 @@ greth_start_xmit_gbit(struct sk_buff *sk
+ {
+ 	struct greth_private *greth = netdev_priv(dev);
+ 	struct greth_bd *bdp;
+-	u32 status, dma_addr;
++	//u32 status, dma_addr;
++	u32 status;
++	dma_addr_t dma_addr;
+ 	int curr_tx, nr_frags, i, err = NETDEV_TX_OK;
+ 	unsigned long flags;
+ 	u16 tx_last;
+@@ -743,9 +802,20 @@ static int greth_rx(struct net_device *d
+ 	struct sk_buff *skb;
+ 	int pkt_len;
+ 	int bad, count;
+-	u32 status, dma_addr;
++	//u32 status, dma_addr;
++	u32 status;
+ 	unsigned long flags;
+ 
++	dma_addr_t dma_addr;
++
++	int i, j;
++	int len;
++	int len_rest;
++
++	unsigned char *dma_dst;
++	unsigned char *dma_src;
++	void *tmp_skb_put;
++
+ 	greth = netdev_priv(dev);
+ 
+ 	for (count = 0; count < limit; ++count) {
+@@ -801,12 +871,43 @@ static int greth_rx(struct net_device *d
+ 							pkt_len,
+ 							DMA_FROM_DEVICE);
+ 
++				//if (netif_msg_pktdata(greth))
++				//	greth_print_rx_packet(phys_to_virt(dma_addr), pkt_len);
++
+ 				if (netif_msg_pktdata(greth))
+-					greth_print_rx_packet(phys_to_virt(dma_addr), pkt_len);
++					greth_print_rx_packet(greth->rx_bufs[greth->rx_cur], pkt_len);
++
++				//skb_put_data(skb, phys_to_virt(dma_addr),
++				//	     pkt_len);
+ 
+-				skb_put_data(skb, phys_to_virt(dma_addr),
+-					     pkt_len);
++				//skb_put_data(skb, greth->rx_bufs[greth->rx_cur],
++				//	     pkt_len);
+ 
++				/* Workaround to fix little vs. big endian */
++				tmp_skb_put = skb_put(skb, pkt_len);
++
++				dma_dst = (unsigned char*) tmp_skb_put;
++				dma_src = (unsigned char*) greth->rx_bufs[greth->rx_cur];
++
++				/*
++				for (i = 0; i < (pkt_len + 3) >> 2; i++)
++					for (j = 0; j < 4; j++)
++						dma_dst[(i << 2) + j] = dma_src[(i << 2) + 3 - j];	
++				*/
++
++				len = pkt_len >> 2;
++				len_rest = pkt_len - (len << 2);
++
++				for (i = 0; i < len; i++)
++					for (j = 0; j < 4; j++)
++						dma_dst[(i << 2) + j] = dma_src[(i << 2) + 3 - j];
++
++				if(len_rest > 0) {
++					for (j = 0; j < 4; j++)
++						if(j < len_rest)
++							dma_dst[(len << 2) + j] = dma_src[(len << 2) + 3 - j];
++				}
++			
+ 				skb->protocol = eth_type_trans(skb, dev);
+ 				dev->stats.rx_bytes += pkt_len;
+ 				dev->stats.rx_packets++;
+@@ -1151,7 +1252,7 @@ static struct net_device_ops greth_netde
+ 
+ static inline int wait_for_mdio(struct greth_private *greth)
+ {
+-	unsigned long timeout = jiffies + 4*HZ/100;
++	unsigned long timeout = jiffies + msecs_to_jiffies(100);
+ 	while (GRETH_REGLOAD(greth->regs->mdio) & GRETH_MII_BUSY) {
+ 		if (time_after(jiffies, timeout))
+ 			return 0;
+@@ -1321,7 +1422,9 @@ static int greth_mdio_init(struct greth_
+ 	/* If Ethernet debug link is used make autoneg happen right away */
+ 	if (greth->edcl && greth_edcl == 1) {
+ 		phy_start_aneg(ndev->phydev);
+-		timeout = jiffies + 6*HZ;
++		//timeout = jiffies + 6*HZ;
++		timeout = jiffies + 100*HZ;
++
+ 		while (!phy_aneg_done(ndev->phydev) &&
+ 		       time_before(jiffies, timeout)) {
+ 		}
+@@ -1344,6 +1447,7 @@ static int greth_of_probe(struct platfor
+ 	struct net_device *dev;
+ 	struct greth_private *greth;
+ 	struct greth_regs *regs;
++	struct resource *res;
+ 
+ 	int i;
+ 	int err;
+@@ -1366,9 +1470,10 @@ static int greth_of_probe(struct platfor
+ 
+ 	spin_lock_init(&greth->devlock);
+ 
+-	greth->regs = of_ioremap(&ofdev->resource[0], 0,
+-				 resource_size(&ofdev->resource[0]),
+-				 "grlib-greth regs");
++	//greth->regs = devm_platform_ioremap_resource(ofdev, 0);
++
++	res = platform_get_resource(ofdev, IORESOURCE_MEM, 0);
++	greth->regs = devm_ioremap_resource(&ofdev->dev, res);
+ 
+ 	if (greth->regs == NULL) {
+ 		if (netif_msg_probe(greth))
+@@ -1378,7 +1483,13 @@ static int greth_of_probe(struct platfor
+ 	}
+ 
+ 	regs = greth->regs;
+-	greth->irq = ofdev->archdata.irqs[0];
++
++	//greth->irq = platform_get_irq(ofdev, 0);
++
++	greth->irq = of_irq_get(ofdev->dev.of_node, 0);
++
++	if (greth->irq < 0)
++		return greth->irq;
+ 
+ 	dev_set_drvdata(greth->dev, dev);
+ 	SET_NETDEV_DEV(dev, greth->dev);
+@@ -1427,6 +1538,12 @@ static int greth_of_probe(struct platfor
+ 		goto error2;
+ 	}
+ 
++	err = of_reserved_mem_device_init(greth->dev);
++	if(err)
++		dev_warn(greth->dev, "Could not get reserved memory\n");
++	else
++		dma_set_coherent_mask(greth->dev, 0xFFFFFFFF);
++
+ 	/* Allocate TX descriptor ring in coherent memory */
+ 	greth->tx_bd_base = dma_alloc_coherent(greth->dev, 1024,
+ 					       &greth->tx_bd_base_phys,
+@@ -1520,7 +1637,6 @@ error4:
+ error3:
+ 	mdiobus_unregister(greth->mdio);
+ error2:
+-	of_iounmap(&ofdev->resource[0], greth->regs, resource_size(&ofdev->resource[0]));
+ error1:
+ 	free_netdev(dev);
+ 	return err;
+@@ -1542,8 +1658,6 @@ static int greth_of_remove(struct platfo
+ 
+ 	unregister_netdev(ndev);
+ 
+-	of_iounmap(&of_dev->resource[0], greth->regs, resource_size(&of_dev->resource[0]));
+-
+ 	free_netdev(ndev);
+ 
+ 	return 0;
+@@ -1556,6 +1670,9 @@ static const struct of_device_id greth_o
+ 	{
+ 	 .name = "01_01d",
+ 	 },
++	{
++	 .compatible = "gaisler,ethmac",
++	},
+ 	{},
+ };
+ 
+Binary files a/drivers/net/ethernet/aeroflex/greth.zip and b/drivers/net/ethernet/aeroflex/greth.zip differ
+diff -urpN a/drivers/net/ethernet/aeroflex/Kconfig b/drivers/net/ethernet/aeroflex/Kconfig
+--- a/drivers/net/ethernet/aeroflex/Kconfig	2026-01-19 13:10:20.000000000 +0100
++++ b/drivers/net/ethernet/aeroflex/Kconfig	2026-02-06 11:58:17.000000000 +0100
+@@ -1,11 +1,9 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-#
+ # Aeroflex Gaisler network device configuration
+ #
+ 
+ config GRETH
+ 	tristate "Aeroflex Gaisler GRETH Ethernet MAC support"
+-	depends on SPARC
+ 	select PHYLIB
+ 	select CRC32
+ 	help
+diff -urpN a/drivers/net/phy/phy.c b/drivers/net/phy/phy.c
+--- a/drivers/net/phy/phy.c	2026-01-19 13:10:20.000000000 +0100
++++ b/drivers/net/phy/phy.c	2026-02-18 11:36:44.327444158 +0100
+@@ -1208,8 +1208,12 @@ void phy_state_machine(struct work_struc
+ 	if (err == -ENODEV)
+ 		return;
+ 
+-	if (err < 0)
++	if (err < 0) {
++		pr_info("error code: %d\n", err);
++		pr_info("old_state: %d\n", old_state);
++		pr_info("phydev->state: %d\n", phydev->state);
+ 		phy_error(phydev);
++	}
+ 
+ 	phy_process_state_change(phydev, old_state);
+ 
+diff -urpN a/drivers/tty/serial/apbuart.c b/drivers/tty/serial/apbuart.c
+--- a/drivers/tty/serial/apbuart.c	2026-01-19 13:10:20.000000000 +0100
++++ b/drivers/tty/serial/apbuart.c	2026-02-25 10:47:29.607700703 +0100
+@@ -25,6 +25,7 @@
+ #include <linux/of_device.h>
+ #include <linux/of_platform.h>
+ #include <linux/of_irq.h>
++#include <linux/of_address.h>
+ #include <linux/platform_device.h>
+ #include <linux/io.h>
+ #include <linux/serial_core.h>
+@@ -235,9 +236,11 @@ static void apbuart_set_termios(struct u
+ 	unsigned int baud, quot;
+ 
+ 	/* Ask the core to calculate the divisor for us. */
+-	baud = uart_get_baud_rate(port, termios, old, 0, port->uartclk / 16);
++	//baud = uart_get_baud_rate(port, termios, old, 0, port->uartclk / 16);
++	baud = uart_get_baud_rate(port, termios, old, 0, port->uartclk / 8);
+ 	if (baud == 0)
+-		panic("invalid baudrate %i\n", port->uartclk / 16);
++		//panic("invalid baudrate %i\n", port->uartclk / 16);
++		panic("invalid baudrate %i\n", port->uartclk / 8);
+ 
+ 	/* uart_get_divisor calc a *16 uart freq, apbuart is *8 */
+ 	quot = (uart_get_divisor(port, baud)) * 2;
+@@ -445,6 +448,7 @@ apbuart_console_write(struct console *co
+ 	UART_PUT_CTRL(port, old_cr);
+ }
+ 
++/*
+ static void __init
+ apbuart_console_get_options(struct uart_port *port, int *baud,
+ 			    int *parity, int *bits)
+@@ -467,6 +471,7 @@ apbuart_console_get_options(struct uart_
+ 		*baud = port->uartclk / (16 * (quot + 1));
+ 	}
+ }
++*/
+ 
+ static int __init apbuart_console_setup(struct console *co, char *options)
+ {
+@@ -493,8 +498,8 @@ static int __init apbuart_console_setup(
+ 
+ 	if (options)
+ 		uart_parse_options(options, &baud, &parity, &bits, &flow);
+-	else
+-		apbuart_console_get_options(port, &baud, &parity, &bits);
++	//else
++	//	apbuart_console_get_options(port, &baud, &parity, &bits);
+ 
+ 	return uart_set_options(port, co, baud, parity, bits, flow);
+ }
+@@ -556,7 +561,8 @@ static int apbuart_probe(struct platform
+ 
+ 	port = &grlib_apbuart_ports[i];
+ 	port->dev = &op->dev;
+-	port->irq = op->archdata.irqs[0];
++	//port->irq = op->archdata.irqs[0];
++	port->irq = of_irq_get(op->dev.of_node, 0);
+ 
+ 	uart_add_one_port(&grlib_apbuart_driver, (struct uart_port *) port);
+ 
+@@ -574,6 +580,9 @@ static const struct of_device_id apbuart
+ 	{
+ 	 .name = "01_00c",
+ 	 },
++	{
++	 .compatible = "gaisler,apbuart",
++	 },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, apbuart_match);
+@@ -594,24 +603,31 @@ static int __init grlib_apbuart_configur
+ 
+ 	for_each_matching_node(np, apbuart_match) {
+ 		const int *ampopts;
+-		const u32 *freq_hz;
++		//const u32 *freq_hz;
++		u32 freq_hz;
+ 		const struct amba_prom_registers *regs;
+ 		struct uart_port *port;
+ 		unsigned long addr;
++		struct resource resource;
++		int ret;
+ 
+ 		ampopts = of_get_property(np, "ampopts", NULL);
+ 		if (ampopts && (*ampopts == 0))
+ 			continue; /* Ignore if used by another OS instance */
+ 		regs = of_get_property(np, "reg", NULL);
+ 		/* Frequency of APB Bus is frequency of UART */
+-		freq_hz = of_get_property(np, "freq", NULL);
++		//freq_hz = of_get_property(np, "freq", NULL);
++		freq_hz = be32_to_cpup(of_get_property(np, "freq", NULL));
+ 
+-		if (!regs || !freq_hz || (*freq_hz == 0))
++		//if (!regs || !freq_hz || (*freq_hz == 0))
++		if (freq_hz == 0)
+ 			continue;
+ 
+ 		grlib_apbuart_nodes[line] = np;
+ 
+-		addr = regs->phys_addr;
++		//addr = regs->phys_addr;
++		ret = of_address_to_resource(np, 0, &resource);
++		addr = resource.start;
+ 
+ 		port = &grlib_apbuart_ports[line];
+ 
+@@ -623,7 +639,8 @@ static int __init grlib_apbuart_configur
+ 		port->has_sysrq = IS_ENABLED(CONFIG_SERIAL_GRLIB_GAISLER_APBUART_CONSOLE);
+ 		port->flags = UPF_BOOT_AUTOCONF;
+ 		port->line = line;
+-		port->uartclk = *freq_hz;
++		//port->uartclk = *freq_hz;
++		port->uartclk = freq_hz;
+ 		port->fifosize = apbuart_scan_fifo_size((struct uart_port *) port, line);
+ 		line++;
+ 
+diff -urpN a/drivers/tty/serial/Kconfig b/drivers/tty/serial/Kconfig
+--- a/drivers/tty/serial/Kconfig	2026-01-19 13:10:20.000000000 +0100
++++ b/drivers/tty/serial/Kconfig	2026-02-25 10:47:48.280672846 +0100
+@@ -1119,7 +1119,7 @@ config SERIAL_BCM63XX_CONSOLE
+ 
+ config SERIAL_GRLIB_GAISLER_APBUART
+ 	tristate "GRLIB APBUART serial support"
+-	depends on OF && SPARC
++	depends on OF
+ 	select SERIAL_CORE
+ 	help
+ 	Add support for the GRLIB APBUART serial port.
