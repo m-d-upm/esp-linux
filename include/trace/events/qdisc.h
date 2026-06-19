@@ -41,7 +41,7 @@ TRACE_EVENT(qdisc_dequeue,
 		__entry->txq_state	= txq->state;
 	),
 
-	TP_printk("dequeue ifindex=%d qdisc handle=0x%X parent=0x%X txq_state=0x%lX packets=%d skbaddr=%px",
+	TP_printk("dequeue ifindex=%d qdisc handle=0x%X parent=0x%X txq_state=0x%lX packets=%d skbaddr=%p",
 		  __entry->ifindex, __entry->handle, __entry->parent,
 		  __entry->txq_state, __entry->packets, __entry->skbaddr )
 );
@@ -70,7 +70,7 @@ TRACE_EVENT(qdisc_enqueue,
 		__entry->parent	 = qdisc->parent;
 	),
 
-	TP_printk("enqueue ifindex=%d qdisc handle=0x%X parent=0x%X skbaddr=%px",
+	TP_printk("enqueue ifindex=%d qdisc handle=0x%X parent=0x%X skbaddr=%p",
 		  __entry->ifindex, __entry->handle, __entry->parent, __entry->skbaddr)
 );
 
@@ -88,8 +88,8 @@ TRACE_EVENT(qdisc_reset,
 	),
 
 	TP_fast_assign(
-		__assign_str(dev, qdisc_dev(q) ? qdisc_dev(q)->name : "(null)");
-		__assign_str(kind, q->ops->id);
+		__assign_str(dev);
+		__assign_str(kind);
 		__entry->parent = q->parent;
 		__entry->handle = q->handle;
 	),
@@ -113,8 +113,8 @@ TRACE_EVENT(qdisc_destroy,
 	),
 
 	TP_fast_assign(
-		__assign_str(dev, qdisc_dev(q)->name);
-		__assign_str(kind, q->ops->id);
+		__assign_str(dev);
+		__assign_str(kind);
 		__entry->parent = q->parent;
 		__entry->handle = q->handle;
 	),
@@ -137,8 +137,8 @@ TRACE_EVENT(qdisc_create,
 	),
 
 	TP_fast_assign(
-		__assign_str(dev, dev->name);
-		__assign_str(kind, ops->id);
+		__assign_str(dev);
+		__assign_str(kind);
 		__entry->parent = parent;
 	),
 

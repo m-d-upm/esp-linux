@@ -8,11 +8,14 @@
 /*
  * User space memory access functions
  */
+#include <linux/kernel.h>
 #include <linux/string.h>
-#include <asm/memory.h>
+#include <asm/page.h>
 #include <asm/domain.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <asm/unified.h>
+#include <asm/pgtable.h>
+#include <asm/proc-fns.h>
 #include <asm/compiler.h>
 
 #include <asm/extable.h>
@@ -23,9 +26,10 @@
  * perform such accesses (eg, via list poison values) which could then
  * be exploited for priviledge escalation.
  */
+#if defined(CONFIG_CPU_SW_DOMAIN_PAN)
+
 static __always_inline unsigned int uaccess_save_and_enable(void)
 {
-#ifdef CONFIG_CPU_SW_DOMAIN_PAN
 	unsigned int old_domain = get_domain();
 
 	/* Set the current domain access to permit user accesses */
@@ -33,18 +37,48 @@ static __always_inline unsigned int uaccess_save_and_enable(void)
 		   domain_val(DOMAIN_USER, DOMAIN_CLIENT));
 
 	return old_domain;
-#else
-	return 0;
-#endif
 }
 
 static __always_inline void uaccess_restore(unsigned int flags)
 {
-#ifdef CONFIG_CPU_SW_DOMAIN_PAN
 	/* Restore the user access mask */
 	set_domain(flags);
-#endif
 }
+
+#elif defined(CONFIG_CPU_TTBR0_PAN)
+
+static __always_inline unsigned int uaccess_save_and_enable(void)
+{
+	unsigned int old_ttbcr = cpu_get_ttbcr();
+
+	/*
+	 * Enable TTBR0 page table walks (T0SZ = 0, EDP0 = 0) and ASID from
+	 * TTBR0 (A1 = 0).
+	 */
+	cpu_set_ttbcr(old_ttbcr & ~(TTBCR_A1 | TTBCR_EPD0 | TTBCR_T0SZ_MASK));
+	isb();
+
+	return old_ttbcr;
+}
+
+static inline void uaccess_restore(unsigned int flags)
+{
+	cpu_set_ttbcr(flags);
+	isb();
+}
+
+#else
+
+static inline unsigned int uaccess_save_and_enable(void)
+{
+	return 0;
+}
+
+static inline void uaccess_restore(unsigned int flags)
+{
+}
+
+#endif
 
 /*
  * These two are intentionally not defined anywhere - if the kernel
@@ -54,21 +88,6 @@ extern int __get_user_bad(void);
 extern int __put_user_bad(void);
 
 #ifdef CONFIG_MMU
-
-/*
- * We use 33-bit arithmetic here.  Success returns zero, failure returns
- * addr_limit.  We take advantage that addr_limit will be zero for KERNEL_DS,
- * so this will always return success in that case.
- */
-#define __range_ok(addr, size) ({ \
-	unsigned long flag, roksum; \
-	__chk_user_ptr(addr);	\
-	__asm__(".syntax unified\n" \
-		"adds %1, %2, %3; sbcscc %1, %1, %0; movcc %0, #0" \
-		: "=&r" (flag), "=&r" (roksum) \
-		: "r" (addr), "Ir" (size), "0" (TASK_SIZE) \
-		: "cc"); \
-	flag; })
 
 /*
  * This is a type: either unsigned long, if the argument fits into
@@ -231,15 +250,12 @@ extern int __put_user_8(void *, unsigned long long);
 
 #else /* CONFIG_MMU */
 
-#define __addr_ok(addr)		((void)(addr), 1)
-#define __range_ok(addr, size)	((void)(addr), 0)
-
 #define get_user(x, p)	__get_user(x, p)
 #define __put_user_check __put_user_nocheck
 
 #endif /* CONFIG_MMU */
 
-#define access_ok(addr, size)	(__range_ok(addr, size) == 0)
+#include <asm-generic/access_ok.h>
 
 #ifdef CONFIG_CPU_SPECTRE
 /*
@@ -465,8 +481,6 @@ do {									\
 	: "+r" (err), "+r" (__pu_addr)				\
 	: "r" (x), "i" (-EFAULT)				\
 	: "cc")
-
-#define HAVE_GET_KERNEL_NOFAULT
 
 #define __get_kernel_nofault(dst, src, type, err_label)			\
 do {									\

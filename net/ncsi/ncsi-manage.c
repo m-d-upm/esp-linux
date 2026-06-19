@@ -88,7 +88,7 @@ report:
 
 static void ncsi_channel_monitor(struct timer_list *t)
 {
-	struct ncsi_channel *nc = from_timer(nc, t, monitor.timer);
+	struct ncsi_channel *nc = timer_container_of(nc, t, monitor.timer);
 	struct ncsi_package *np = nc->package;
 	struct ncsi_dev_priv *ndp = np->ndp;
 	struct ncsi_channel_mode *ncm;
@@ -189,7 +189,7 @@ void ncsi_stop_channel_monitor(struct ncsi_channel *nc)
 	nc->monitor.enabled = false;
 	spin_unlock_irqrestore(&nc->lock, flags);
 
-	del_timer_sync(&nc->monitor.timer);
+	timer_delete_sync(&nc->monitor.timer);
 }
 
 struct ncsi_channel *ncsi_find_channel(struct ncsi_package *np,
@@ -396,7 +396,7 @@ void ncsi_free_request(struct ncsi_request *nr)
 
 	if (nr->enabled) {
 		nr->enabled = false;
-		del_timer_sync(&nr->timer);
+		timer_delete_sync(&nr->timer);
 	}
 
 	spin_lock_irqsave(&ndp->lock, flags);
@@ -430,7 +430,7 @@ struct ncsi_dev *ncsi_find_dev(struct net_device *dev)
 
 static void ncsi_request_timeout(struct timer_list *t)
 {
-	struct ncsi_request *nr = from_timer(nr, t, timer);
+	struct ncsi_request *nr = timer_container_of(nr, t, timer);
 	struct ncsi_dev_priv *ndp = nr->ndp;
 	struct ncsi_cmd_pkt *cmd;
 	struct ncsi_package *np;
@@ -610,7 +610,7 @@ static int clear_one_vid(struct ncsi_dev_priv *ndp, struct ncsi_channel *nc,
 	bitmap = &ncf->bitmap;
 
 	spin_lock_irqsave(&nc->lock, flags);
-	index = find_next_bit(bitmap, ncf->n_vids, 0);
+	index = find_first_bit(bitmap, ncf->n_vids);
 	if (index >= ncf->n_vids) {
 		spin_unlock_irqrestore(&nc->lock, flags);
 		return -1;
@@ -669,7 +669,7 @@ static int set_one_vid(struct ncsi_dev_priv *ndp, struct ncsi_channel *nc,
 		return -1;
 	}
 
-	index = find_next_zero_bit(bitmap, ncf->n_vids, 0);
+	index = find_first_zero_bit(bitmap, ncf->n_vids);
 	if (index < 0 || index >= ncf->n_vids) {
 		netdev_err(ndp->ndev.dev,
 			   "Channel %u already has all VLAN filters set\n",
@@ -1805,7 +1805,8 @@ struct ncsi_dev *ncsi_register_dev(struct net_device *dev,
 	pdev = to_platform_device(dev->dev.parent);
 	if (pdev) {
 		np = pdev->dev.of_node;
-		if (np && of_get_property(np, "mlx,multi-host", NULL))
+		if (np && (of_property_read_bool(np, "mellanox,multi-host") ||
+			   of_property_read_bool(np, "mlx,multi-host")))
 			ndp->mlx_multi_host = true;
 	}
 
@@ -1965,6 +1966,8 @@ void ncsi_unregister_dev(struct ncsi_dev *nd)
 	spin_lock_irqsave(&ncsi_dev_lock, flags);
 	list_del_rcu(&ndp->node);
 	spin_unlock_irqrestore(&ncsi_dev_lock, flags);
+
+	disable_work_sync(&ndp->work);
 
 	kfree(ndp);
 }

@@ -214,7 +214,7 @@ static void test_isolated(int parent_cgroup_fd, int child_cgroup_fd)
 	/* Attach to parent and child cgroup, trigger packet from child.
 	 * Assert that there is six additional runs, parent cgroup egresses and
 	 * ingress, child cgroup egresses and ingress.
-	 * Assert that egree and ingress storages are separate.
+	 * Assert that egress and ingress storages are separate.
 	 */
 	child_egress1_link = bpf_program__attach_cgroup(obj->progs.egress1,
 							child_cgroup_fd);
@@ -367,7 +367,7 @@ close_bpf_object:
 	cg_storage_multi_shared__destroy(obj);
 }
 
-void test_cg_storage_multi(void)
+void serial_test_cg_storage_multi(void)
 {
 	int parent_cgroup_fd = -1, child_cgroup_fd = -1;
 

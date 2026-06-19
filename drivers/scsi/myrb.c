@@ -16,7 +16,7 @@
 #include <linux/interrupt.h>
 #include <linux/pci.h>
 #include <linux/raid_class.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <scsi/scsi.h>
 #include <scsi/scsi_host.h>
 #include <scsi/scsi_device.h>
@@ -112,9 +112,8 @@ static bool myrb_create_mempools(struct pci_dev *pdev, struct myrb_hba *cb)
 		return false;
 	}
 
-	snprintf(cb->work_q_name, sizeof(cb->work_q_name),
-		 "myrb_wq_%d", cb->host->host_no);
-	cb->work_q = create_singlethread_workqueue(cb->work_q_name);
+	cb->work_q = alloc_ordered_workqueue("myrb_wq_%d", WQ_MEM_RECLAIM,
+					     cb->host->host_no);
 	if (!cb->work_q) {
 		dma_pool_destroy(cb->dcdb_pool);
 		cb->dcdb_pool = NULL;
@@ -892,7 +891,7 @@ static bool myrb_enable_mmio(struct myrb_hba *cb, mbox_mmio_init_t mmio_init_fn)
 		status = mmio_init_fn(pdev, base, &mbox);
 		if (status != MYRB_STATUS_SUCCESS) {
 			dev_err(&pdev->dev,
-				"Failed to enable mailbox, statux %02X\n",
+				"Failed to enable mailbox, status %02X\n",
 				status);
 			return false;
 		}
@@ -1283,7 +1282,7 @@ static int myrb_pthru_queuecommand(struct Scsi_Host *shost,
 	if (nsge > 1) {
 		dma_pool_free(cb->dcdb_pool, dcdb, dcdb_addr);
 		scmd->result = (DID_ERROR << 16);
-		scmd->scsi_done(scmd);
+		scsi_done(scmd);
 		return 0;
 	}
 
@@ -1437,13 +1436,13 @@ static int myrb_ldev_queuecommand(struct Scsi_Host *shost,
 		dev_dbg(&shost->shost_gendev, "ldev %u in state %x, skip\n",
 			sdev->id, ldev_info ? ldev_info->state : 0xff);
 		scmd->result = (DID_BAD_TARGET << 16);
-		scmd->scsi_done(scmd);
+		scsi_done(scmd);
 		return 0;
 	}
 	switch (scmd->cmnd[0]) {
 	case TEST_UNIT_READY:
 		scmd->result = (DID_OK << 16);
-		scmd->scsi_done(scmd);
+		scsi_done(scmd);
 		return 0;
 	case INQUIRY:
 		if (scmd->cmnd[1] & 1) {
@@ -1453,11 +1452,11 @@ static int myrb_ldev_queuecommand(struct Scsi_Host *shost,
 			myrb_inquiry(cb, scmd);
 			scmd->result = (DID_OK << 16);
 		}
-		scmd->scsi_done(scmd);
+		scsi_done(scmd);
 		return 0;
 	case SYNCHRONIZE_CACHE:
 		scmd->result = (DID_OK << 16);
-		scmd->scsi_done(scmd);
+		scsi_done(scmd);
 		return 0;
 	case MODE_SENSE:
 		if ((scmd->cmnd[2] & 0x3F) != 0x3F &&
@@ -1468,25 +1467,25 @@ static int myrb_ldev_queuecommand(struct Scsi_Host *shost,
 			myrb_mode_sense(cb, scmd, ldev_info);
 			scmd->result = (DID_OK << 16);
 		}
-		scmd->scsi_done(scmd);
+		scsi_done(scmd);
 		return 0;
 	case READ_CAPACITY:
 		if ((scmd->cmnd[1] & 1) ||
 		    (scmd->cmnd[8] & 1)) {
 			/* Illegal request, invalid field in CDB */
 			scsi_build_sense(scmd, 0, ILLEGAL_REQUEST, 0x24, 0);
-			scmd->scsi_done(scmd);
+			scsi_done(scmd);
 			return 0;
 		}
 		lba = get_unaligned_be32(&scmd->cmnd[2]);
 		if (lba) {
 			/* Illegal request, invalid field in CDB */
 			scsi_build_sense(scmd, 0, ILLEGAL_REQUEST, 0x24, 0);
-			scmd->scsi_done(scmd);
+			scsi_done(scmd);
 			return 0;
 		}
 		myrb_read_capacity(cb, scmd, ldev_info);
-		scmd->scsi_done(scmd);
+		scsi_done(scmd);
 		return 0;
 	case REQUEST_SENSE:
 		myrb_request_sense(cb, scmd);
@@ -1500,13 +1499,13 @@ static int myrb_ldev_queuecommand(struct Scsi_Host *shost,
 			/* Assume good status */
 			scmd->result = (DID_OK << 16);
 		}
-		scmd->scsi_done(scmd);
+		scsi_done(scmd);
 		return 0;
 	case READ_6:
 		if (ldev_info->state == MYRB_DEVICE_WO) {
 			/* Data protect, attempt to read invalid data */
 			scsi_build_sense(scmd, 0, DATA_PROTECT, 0x21, 0x06);
-			scmd->scsi_done(scmd);
+			scsi_done(scmd);
 			return 0;
 		}
 		fallthrough;
@@ -1520,7 +1519,7 @@ static int myrb_ldev_queuecommand(struct Scsi_Host *shost,
 		if (ldev_info->state == MYRB_DEVICE_WO) {
 			/* Data protect, attempt to read invalid data */
 			scsi_build_sense(scmd, 0, DATA_PROTECT, 0x21, 0x06);
-			scmd->scsi_done(scmd);
+			scsi_done(scmd);
 			return 0;
 		}
 		fallthrough;
@@ -1534,7 +1533,7 @@ static int myrb_ldev_queuecommand(struct Scsi_Host *shost,
 		if (ldev_info->state == MYRB_DEVICE_WO) {
 			/* Data protect, attempt to read invalid data */
 			scsi_build_sense(scmd, 0, DATA_PROTECT, 0x21, 0x06);
-			scmd->scsi_done(scmd);
+			scsi_done(scmd);
 			return 0;
 		}
 		fallthrough;
@@ -1547,7 +1546,7 @@ static int myrb_ldev_queuecommand(struct Scsi_Host *shost,
 	default:
 		/* Illegal request, invalid opcode */
 		scsi_build_sense(scmd, 0, ILLEGAL_REQUEST, 0x20, 0);
-		scmd->scsi_done(scmd);
+		scsi_done(scmd);
 		return 0;
 	}
 
@@ -1611,7 +1610,7 @@ static int myrb_queuecommand(struct Scsi_Host *shost,
 
 	if (sdev->channel > myrb_logical_channel(shost)) {
 		scmd->result = (DID_BAD_TARGET << 16);
-		scmd->scsi_done(scmd);
+		scsi_done(scmd);
 		return 0;
 	}
 	if (sdev->channel == myrb_logical_channel(shost))
@@ -1620,7 +1619,7 @@ static int myrb_queuecommand(struct Scsi_Host *shost,
 	return myrb_pthru_queuecommand(shost, scmd);
 }
 
-static int myrb_ldev_slave_alloc(struct scsi_device *sdev)
+static int myrb_ldev_sdev_init(struct scsi_device *sdev)
 {
 	struct myrb_hba *cb = shost_priv(sdev->host);
 	struct myrb_ldev_info *ldev_info;
@@ -1628,8 +1627,6 @@ static int myrb_ldev_slave_alloc(struct scsi_device *sdev)
 	enum raid_level level;
 
 	ldev_info = cb->ldev_info_buf + ldev_num;
-	if (!ldev_info)
-		return -ENXIO;
 
 	sdev->hostdata = kzalloc(sizeof(*ldev_info), GFP_KERNEL);
 	if (!sdev->hostdata)
@@ -1666,7 +1663,7 @@ static int myrb_ldev_slave_alloc(struct scsi_device *sdev)
 	return 0;
 }
 
-static int myrb_pdev_slave_alloc(struct scsi_device *sdev)
+static int myrb_pdev_sdev_init(struct scsi_device *sdev)
 {
 	struct myrb_hba *cb = shost_priv(sdev->host);
 	struct myrb_pdev_state *pdev_info;
@@ -1675,7 +1672,7 @@ static int myrb_pdev_slave_alloc(struct scsi_device *sdev)
 	if (sdev->id > MYRB_MAX_TARGETS)
 		return -ENXIO;
 
-	pdev_info = kzalloc(sizeof(*pdev_info), GFP_KERNEL|GFP_DMA);
+	pdev_info = kzalloc(sizeof(*pdev_info), GFP_KERNEL);
 	if (!pdev_info)
 		return -ENOMEM;
 
@@ -1702,7 +1699,7 @@ static int myrb_pdev_slave_alloc(struct scsi_device *sdev)
 	return 0;
 }
 
-static int myrb_slave_alloc(struct scsi_device *sdev)
+static int myrb_sdev_init(struct scsi_device *sdev)
 {
 	if (sdev->channel > myrb_logical_channel(sdev->host))
 		return -ENXIO;
@@ -1711,12 +1708,13 @@ static int myrb_slave_alloc(struct scsi_device *sdev)
 		return -ENXIO;
 
 	if (sdev->channel == myrb_logical_channel(sdev->host))
-		return myrb_ldev_slave_alloc(sdev);
+		return myrb_ldev_sdev_init(sdev);
 
-	return myrb_pdev_slave_alloc(sdev);
+	return myrb_pdev_sdev_init(sdev);
 }
 
-static int myrb_slave_configure(struct scsi_device *sdev)
+static int myrb_sdev_configure(struct scsi_device *sdev,
+			       struct queue_limits *lim)
 {
 	struct myrb_ldev_info *ldev_info;
 
@@ -1742,12 +1740,12 @@ static int myrb_slave_configure(struct scsi_device *sdev)
 	return 0;
 }
 
-static void myrb_slave_destroy(struct scsi_device *sdev)
+static void myrb_sdev_destroy(struct scsi_device *sdev)
 {
 	kfree(sdev->hostdata);
 }
 
-static int myrb_biosparam(struct scsi_device *sdev, struct block_device *bdev,
+static int myrb_biosparam(struct scsi_device *sdev, struct gendisk *unused,
 		sector_t capacity, int geom[])
 {
 	struct myrb_hba *cb = shost_priv(sdev->host);
@@ -2183,35 +2181,39 @@ static ssize_t flush_cache_store(struct device *dev,
 }
 static DEVICE_ATTR_WO(flush_cache);
 
-static struct device_attribute *myrb_sdev_attrs[] = {
-	&dev_attr_rebuild,
-	&dev_attr_consistency_check,
-	&dev_attr_raid_state,
-	&dev_attr_raid_level,
+static struct attribute *myrb_sdev_attrs[] = {
+	&dev_attr_rebuild.attr,
+	&dev_attr_consistency_check.attr,
+	&dev_attr_raid_state.attr,
+	&dev_attr_raid_level.attr,
 	NULL,
 };
 
-static struct device_attribute *myrb_shost_attrs[] = {
-	&dev_attr_ctlr_num,
-	&dev_attr_model,
-	&dev_attr_firmware,
-	&dev_attr_flush_cache,
+ATTRIBUTE_GROUPS(myrb_sdev);
+
+static struct attribute *myrb_shost_attrs[] = {
+	&dev_attr_ctlr_num.attr,
+	&dev_attr_model.attr,
+	&dev_attr_firmware.attr,
+	&dev_attr_flush_cache.attr,
 	NULL,
 };
 
-static struct scsi_host_template myrb_template = {
+ATTRIBUTE_GROUPS(myrb_shost);
+
+static const struct scsi_host_template myrb_template = {
 	.module			= THIS_MODULE,
 	.name			= "DAC960",
 	.proc_name		= "myrb",
 	.queuecommand		= myrb_queuecommand,
 	.eh_host_reset_handler	= myrb_host_reset,
-	.slave_alloc		= myrb_slave_alloc,
-	.slave_configure	= myrb_slave_configure,
-	.slave_destroy		= myrb_slave_destroy,
+	.sdev_init		= myrb_sdev_init,
+	.sdev_configure		= myrb_sdev_configure,
+	.sdev_destroy		= myrb_sdev_destroy,
 	.bios_param		= myrb_biosparam,
 	.cmd_size		= sizeof(struct myrb_cmdblk),
-	.shost_attrs		= myrb_shost_attrs,
-	.sdev_attrs		= myrb_sdev_attrs,
+	.shost_groups		= myrb_shost_groups,
+	.sdev_groups		= myrb_sdev_groups,
 	.this_id		= -1,
 };
 
@@ -2362,7 +2364,7 @@ static void myrb_handle_scsi(struct myrb_hba *cb, struct myrb_cmdblk *cmd_blk,
 		scmd->result = (DID_ERROR << 16);
 		break;
 	}
-	scmd->scsi_done(scmd);
+	scsi_done(scmd);
 }
 
 static void myrb_handle_cmdblk(struct myrb_hba *cb, struct myrb_cmdblk *cmd_blk)

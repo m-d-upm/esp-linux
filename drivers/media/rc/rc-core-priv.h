@@ -85,8 +85,8 @@ struct ir_raw_event_ctrl {
 	struct rc6_dec {
 		int state;
 		u8 header;
-		u32 body;
 		bool toggle;
+		u32 body;
 		unsigned count;
 		unsigned wanted_bits;
 	} rc6;
@@ -127,8 +127,8 @@ struct ir_raw_event_ctrl {
 	struct mce_kbd_dec {
 		/* locks key up timer */
 		spinlock_t keylock;
-		struct timer_list rx_timeout;
 		int state;
+		struct timer_list rx_timeout;
 		u8 header;
 		u32 body;
 		unsigned count;
@@ -190,7 +190,7 @@ static inline void decrease_duration(struct ir_raw_event *ev, unsigned duration)
 /* Returns true if event is normal pulse/space event */
 static inline bool is_timing_event(struct ir_raw_event ev)
 {
-	return !ev.carrier_report && !ev.reset;
+	return !ev.carrier_report && !ev.overflow;
 }
 
 #define TO_STR(is_pulse)		((is_pulse) ? "pulse" : "space")

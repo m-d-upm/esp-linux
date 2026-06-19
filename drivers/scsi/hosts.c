@@ -61,6 +61,7 @@ static void scsi_host_cls_release(struct device *dev)
 static struct class shost_class = {
 	.name		= "scsi_host",
 	.dev_release	= scsi_host_cls_release,
+	.dev_groups	= scsi_shost_groups,
 };
 
 /**
@@ -218,7 +219,7 @@ EXPORT_SYMBOL(scsi_remove_host);
 int scsi_add_host_with_dma(struct Scsi_Host *shost, struct device *dev,
 			   struct device *dma_dev)
 {
-	struct scsi_host_template *sht = shost->hostt;
+	const struct scsi_host_template *sht = shost->hostt;
 	int error = -EINVAL;
 
 	shost_printk(KERN_INFO, shost, "%s\n",
@@ -238,16 +239,21 @@ int scsi_add_host_with_dma(struct Scsi_Host *shost, struct device *dev,
 	if (error)
 		goto fail;
 
-	error = scsi_mq_setup_tags(shost);
-	if (error)
-		goto fail;
-
 	if (!shost->shost_gendev.parent)
 		shost->shost_gendev.parent = dev ? dev : &platform_bus;
 	if (!dma_dev)
 		dma_dev = shost->shost_gendev.parent;
 
 	shost->dma_dev = dma_dev;
+
+	if (dma_dev->dma_mask) {
+		shost->max_sectors = min_t(unsigned int, shost->max_sectors,
+				dma_max_mapping_size(dma_dev) >> SECTOR_SHIFT);
+	}
+
+	error = scsi_mq_setup_tags(shost);
+	if (error)
+		goto fail;
 
 	kref_init(&shost->tagset_refcnt);
 	init_completion(&shost->tagset_freed);
@@ -286,11 +292,10 @@ int scsi_add_host_with_dma(struct Scsi_Host *shost, struct device *dev,
 	}
 
 	if (shost->transportt->create_work_queue) {
-		snprintf(shost->work_q_name, sizeof(shost->work_q_name),
-			 "scsi_wq_%d", shost->host_no);
-		shost->work_q = alloc_workqueue("%s",
-			WQ_SYSFS | __WQ_LEGACY | WQ_MEM_RECLAIM | WQ_UNBOUND,
-			1, shost->work_q_name);
+		shost->work_q = alloc_workqueue(
+			"scsi_wq_%d",
+			WQ_SYSFS | __WQ_LEGACY | WQ_MEM_RECLAIM | WQ_UNBOUND, 1,
+			shost->host_no);
 
 		if (!shost->work_q) {
 			error = -EINVAL;
@@ -349,7 +354,7 @@ static void scsi_host_dev_release(struct device *dev)
 		/*
 		 * Free the shost_dev device name and remove the proc host dir
 		 * here if scsi_host_{alloc,put}() have been called but neither
-		 * scsi_host_add() nor scsi_host_remove() has been called.
+		 * scsi_host_add() nor scsi_remove_host() has been called.
 		 * This avoids that the memory allocated for the shost_dev
 		 * name as well as the proc dir structure are leaked.
 		 */
@@ -359,14 +364,14 @@ static void scsi_host_dev_release(struct device *dev)
 
 	kfree(shost->shost_data);
 
-	ida_simple_remove(&host_index_ida, shost->host_no);
+	ida_free(&host_index_ida, shost->host_no);
 
 	if (shost->shost_state != SHOST_CREATED)
 		put_device(parent);
 	kfree(shost);
 }
 
-static struct device_type scsi_host_type = {
+static const struct device_type scsi_host_type = {
 	.name =		"scsi_host",
 	.release =	scsi_host_dev_release,
 };
@@ -384,7 +389,7 @@ static struct device_type scsi_host_type = {
  * Return value:
  * 	Pointer to a new Scsi_Host
  **/
-struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize)
+struct Scsi_Host *scsi_host_alloc(const struct scsi_host_template *sht, int privsize)
 {
 	struct Scsi_Host *shost;
 	int index;
@@ -404,7 +409,7 @@ struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize)
 	init_waitqueue_head(&shost->host_wait);
 	mutex_init(&shost->scan_mutex);
 
-	index = ida_simple_get(&host_index_ida, 0, 0, GFP_KERNEL);
+	index = ida_alloc(&host_index_ida, GFP_KERNEL);
 	if (index < 0) {
 		kfree(shost);
 		return NULL;
@@ -436,6 +441,7 @@ struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize)
 	shost->cmd_per_lun = sht->cmd_per_lun;
 	shost->no_write_same = sht->no_write_same;
 	shost->host_tagset = sht->host_tagset;
+	shost->queuecommand_may_block = sht->queuecommand_may_block;
 
 	if (shost_eh_deadline == -1 || !sht->eh_host_reset_handler)
 		shost->eh_deadline = -1;
@@ -467,10 +473,23 @@ struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize)
 	else
 		shost->max_sectors = SCSI_DEFAULT_MAX_SECTORS;
 
-	if (sht->max_segment_size)
-		shost->max_segment_size = sht->max_segment_size;
+	shost->virt_boundary_mask = sht->virt_boundary_mask;
+	if (shost->virt_boundary_mask) {
+		WARN_ON_ONCE(sht->max_segment_size &&
+			     sht->max_segment_size != UINT_MAX);
+		shost->max_segment_size = UINT_MAX;
+	} else {
+		if (sht->max_segment_size)
+			shost->max_segment_size = sht->max_segment_size;
+		else
+			shost->max_segment_size = BLK_MAX_SEGMENT_SIZE;
+	}
+
+	/* 32-byte (dword) is a common minimum for HBAs. */
+	if (sht->dma_alignment)
+		shost->dma_alignment = sht->dma_alignment;
 	else
-		shost->max_segment_size = BLK_MAX_SEGMENT_SIZE;
+		shost->dma_alignment = 3;
 
 	/*
 	 * assume a 4GB boundary, if not set
@@ -480,19 +499,17 @@ struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize)
 	else
 		shost->dma_boundary = 0xffffffff;
 
-	if (sht->virt_boundary_mask)
-		shost->virt_boundary_mask = sht->virt_boundary_mask;
-
 	device_initialize(&shost->shost_gendev);
 	dev_set_name(&shost->shost_gendev, "host%d", shost->host_no);
 	shost->shost_gendev.bus = &scsi_bus_type;
 	shost->shost_gendev.type = &scsi_host_type;
+	scsi_enable_async_suspend(&shost->shost_gendev);
 
 	device_initialize(&shost->shost_dev);
 	shost->shost_dev.parent = &shost->shost_gendev;
 	shost->shost_dev.class = &shost_class;
 	dev_set_name(&shost->shost_dev, "host%d", shost->host_no);
-	shost->shost_dev.groups = scsi_sysfs_shost_attr_groups;
+	shost->shost_dev.groups = sht->shost_groups;
 
 	shost->ehandler = kthread_run(scsi_error_handler, shost,
 			"scsi_eh_%d", shost->host_no);
@@ -512,7 +529,8 @@ struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize)
 			     "failed to create tmf workq\n");
 		goto fail;
 	}
-	scsi_proc_hostdir_add(shost->hostt);
+	if (scsi_proc_hostdir_add(shost->hostt) < 0)
+		goto fail;
 	return shost;
  fail:
 	/*
@@ -574,8 +592,7 @@ struct Scsi_Host *scsi_host_get(struct Scsi_Host *shost)
 }
 EXPORT_SYMBOL(scsi_host_get);
 
-static bool scsi_host_check_in_flight(struct request *rq, void *data,
-				      bool reserved)
+static bool scsi_host_check_in_flight(struct request *rq, void *data)
 {
 	int *count = data;
 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
@@ -671,7 +688,7 @@ void scsi_flush_work(struct Scsi_Host *shost)
 }
 EXPORT_SYMBOL_GPL(scsi_flush_work);
 
-static bool complete_all_cmds_iter(struct request *rq, void *data, bool rsvd)
+static bool complete_all_cmds_iter(struct request *rq, void *data)
 {
 	struct scsi_cmnd *scmd = blk_mq_rq_to_pdu(rq);
 	enum scsi_host_status status = *(enum scsi_host_status *)data;
@@ -679,7 +696,7 @@ static bool complete_all_cmds_iter(struct request *rq, void *data, bool rsvd)
 	scsi_dma_unmap(scmd);
 	scmd->result = 0;
 	set_host_byte(scmd, status);
-	scmd->scsi_done(scmd);
+	scsi_done(scmd);
 	return true;
 }
 
@@ -702,17 +719,16 @@ void scsi_host_complete_all_commands(struct Scsi_Host *shost,
 EXPORT_SYMBOL_GPL(scsi_host_complete_all_commands);
 
 struct scsi_host_busy_iter_data {
-	bool (*fn)(struct scsi_cmnd *, void *, bool);
+	bool (*fn)(struct scsi_cmnd *, void *);
 	void *priv;
 };
 
-static bool __scsi_host_busy_iter_fn(struct request *req, void *priv,
-				   bool reserved)
+static bool __scsi_host_busy_iter_fn(struct request *req, void *priv)
 {
 	struct scsi_host_busy_iter_data *iter_data = priv;
 	struct scsi_cmnd *sc = blk_mq_rq_to_pdu(req);
 
-	return iter_data->fn(sc, iter_data->priv, reserved);
+	return iter_data->fn(sc, iter_data->priv);
 }
 
 /**
@@ -725,7 +741,7 @@ static bool __scsi_host_busy_iter_fn(struct request *req, void *priv,
  * ithas to be provided by the caller
  **/
 void scsi_host_busy_iter(struct Scsi_Host *shost,
-			 bool (*fn)(struct scsi_cmnd *, void *, bool),
+			 bool (*fn)(struct scsi_cmnd *, void *),
 			 void *priv)
 {
 	struct scsi_host_busy_iter_data iter_data = {

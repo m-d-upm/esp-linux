@@ -1,18 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * OMAP gate clock support
  *
  * Copyright (C) 2013 Texas Instruments, Inc.
  *
  * Tero Kristo <t-kristo@ti.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed "as is" WITHOUT ANY WARRANTY of any
- * kind, whether express or implied; without even the implied warranty
- * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
 #include <linux/clk-provider.h>
@@ -140,7 +132,6 @@ static void __init _of_ti_gate_clk_setup(struct device_node *node,
 	struct clk_omap_reg reg;
 	const char *name;
 	u8 enable_bit = 0;
-	u32 val;
 	u32 flags = 0;
 	u8 clk_gate_flags = 0;
 
@@ -148,8 +139,7 @@ static void __init _of_ti_gate_clk_setup(struct device_node *node,
 		if (ti_clk_get_reg_addr(node, 0, &reg))
 			return;
 
-		if (!of_property_read_u32(node, "ti,bit-shift", &val))
-			enable_bit = val;
+		enable_bit = reg.bit;
 	}
 
 	if (of_clk_get_parent_count(node) != 1) {
@@ -178,7 +168,6 @@ _of_ti_composite_gate_clk_setup(struct device_node *node,
 				const struct clk_hw_omap_ops *hw_ops)
 {
 	struct clk_hw_omap *gate;
-	u32 val = 0;
 
 	gate = kzalloc(sizeof(*gate), GFP_KERNEL);
 	if (!gate)
@@ -187,9 +176,7 @@ _of_ti_composite_gate_clk_setup(struct device_node *node,
 	if (ti_clk_get_reg_addr(node, 0, &gate->enable_reg))
 		goto cleanup;
 
-	of_property_read_u32(node, "ti,bit-shift", &val);
-
-	gate->enable_bit = val;
+	gate->enable_bit = gate->enable_reg.bit;
 	gate->ops = hw_ops;
 
 	if (!ti_clk_add_component(node, &gate->hw, CLK_COMPONENT_TYPE_GATE))

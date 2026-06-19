@@ -26,7 +26,7 @@
 #include <linux/usb/cdc.h>
 #include <linux/wwan.h>
 #include <asm/byteorder.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <linux/usb/cdc-wdm.h>
 
 #define DRIVER_AUTHOR "Oliver Neukum"
@@ -225,7 +225,8 @@ static void wdm_in_callback(struct urb *urb)
 		/* we may already be in overflow */
 		if (!test_bit(WDM_OVERFLOW, &desc->flags)) {
 			memmove(desc->ubuf + desc->length, desc->inbuf, length);
-			desc->length += length;
+			smp_wmb(); /* against wdm_read() */
+			WRITE_ONCE(desc->length, desc->length + length);
 		}
 	}
 skip_error:
@@ -533,6 +534,7 @@ static ssize_t wdm_read
 		return -ERESTARTSYS;
 
 	cntr = READ_ONCE(desc->length);
+	smp_rmb(); /* against wdm_in_callback() */
 	if (cntr == 0) {
 		desc->read = 0;
 retry:
@@ -918,7 +920,7 @@ static int wdm_wwan_port_tx(struct wwan_port *port, struct sk_buff *skb)
 	return rv;
 }
 
-static struct wwan_port_ops wdm_wwan_port_ops = {
+static const struct wwan_port_ops wdm_wwan_port_ops = {
 	.start = wdm_wwan_port_start,
 	.stop = wdm_wwan_port_stop,
 	.tx = wdm_wwan_port_tx,
@@ -935,7 +937,8 @@ static void wdm_wwan_init(struct wdm_device *desc)
 		return;
 	}
 
-	port = wwan_create_port(&intf->dev, desc->wwanp_type, &wdm_wwan_port_ops, desc);
+	port = wwan_create_port(&intf->dev, desc->wwanp_type, &wdm_wwan_port_ops,
+				NULL, desc);
 	if (IS_ERR(port)) {
 		dev_err(&intf->dev, "%s: Unable to create WWAN port\n",
 			dev_name(intf->usb_dev));
@@ -964,7 +967,7 @@ static void wdm_wwan_rx(struct wdm_device *desc, int length)
 	if (!skb)
 		return;
 
-	memcpy(skb_put(skb, length), desc->inbuf, length);
+	skb_put_data(skb, desc->inbuf, length);
 	wwan_port_rx(port, skb);
 
 	/* inbuf has been copied, it is safe to check for outstanding data */

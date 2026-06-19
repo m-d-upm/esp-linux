@@ -91,31 +91,31 @@ MODULE_DEVICE_TABLE(pci, isci_id_table);
 
 /* linux isci specific settings */
 
-unsigned char no_outbound_task_to = 2;
+static unsigned char no_outbound_task_to = 2;
 module_param(no_outbound_task_to, byte, 0);
 MODULE_PARM_DESC(no_outbound_task_to, "No Outbound Task Timeout (1us incr)");
 
-u16 ssp_max_occ_to = 20;
+static u16 ssp_max_occ_to = 20;
 module_param(ssp_max_occ_to, ushort, 0);
 MODULE_PARM_DESC(ssp_max_occ_to, "SSP Max occupancy timeout (100us incr)");
 
-u16 stp_max_occ_to = 5;
+static u16 stp_max_occ_to = 5;
 module_param(stp_max_occ_to, ushort, 0);
 MODULE_PARM_DESC(stp_max_occ_to, "STP Max occupancy timeout (100us incr)");
 
-u16 ssp_inactive_to = 5;
+static u16 ssp_inactive_to = 5;
 module_param(ssp_inactive_to, ushort, 0);
 MODULE_PARM_DESC(ssp_inactive_to, "SSP inactivity timeout (100us incr)");
 
-u16 stp_inactive_to = 5;
+static u16 stp_inactive_to = 5;
 module_param(stp_inactive_to, ushort, 0);
 MODULE_PARM_DESC(stp_inactive_to, "STP inactivity timeout (100us incr)");
 
-unsigned char phy_gen = SCIC_SDS_PARM_GEN2_SPEED;
+static unsigned char phy_gen = SCIC_SDS_PARM_GEN2_SPEED;
 module_param(phy_gen, byte, 0);
 MODULE_PARM_DESC(phy_gen, "PHY generation (1: 1.5Gbps 2: 3.0Gbps 3: 6.0Gbps)");
 
-unsigned char max_concurr_spinup;
+static unsigned char max_concurr_spinup;
 module_param(max_concurr_spinup, byte, 0);
 MODULE_PARM_DESC(max_concurr_spinup, "Max concurrent device spinup");
 
@@ -133,43 +133,32 @@ static ssize_t isci_show_id(struct device *dev, struct device_attribute *attr, c
 	struct sas_ha_struct *sas_ha = SHOST_TO_SAS_HA(shost);
 	struct isci_host *ihost = container_of(sas_ha, typeof(*ihost), sas_ha);
 
-	return snprintf(buf, PAGE_SIZE, "%d\n", ihost->id);
+	return sysfs_emit(buf, "%d\n", ihost->id);
 }
 
 static DEVICE_ATTR(isci_id, S_IRUGO, isci_show_id, NULL);
 
-static struct device_attribute *isci_host_attrs[] = {
-	&dev_attr_isci_id,
+static struct attribute *isci_host_attrs[] = {
+	&dev_attr_isci_id.attr,
 	NULL
 };
 
-static struct scsi_host_template isci_sht = {
+ATTRIBUTE_GROUPS(isci_host);
 
-	.module				= THIS_MODULE,
-	.name				= DRV_NAME,
-	.proc_name			= DRV_NAME,
-	.queuecommand			= sas_queuecommand,
-	.dma_need_drain			= ata_scsi_dma_need_drain,
-	.target_alloc			= sas_target_alloc,
-	.slave_configure		= sas_slave_configure,
+static const struct attribute_group *isci_sdev_groups[] = {
+	&sas_ata_sdev_attr_group,
+	NULL
+};
+
+static const struct scsi_host_template isci_sht = {
+	LIBSAS_SHT_BASE
 	.scan_finished			= isci_host_scan_finished,
 	.scan_start			= isci_host_start,
-	.change_queue_depth		= sas_change_queue_depth,
-	.bios_param			= sas_bios_param,
 	.can_queue			= ISCI_CAN_QUEUE_VAL,
-	.this_id			= -1,
 	.sg_tablesize			= SG_ALL,
-	.max_sectors			= SCSI_DEFAULT_MAX_SECTORS,
-	.eh_abort_handler		= sas_eh_abort_handler,
-	.eh_device_reset_handler        = sas_eh_device_reset_handler,
-	.eh_target_reset_handler        = sas_eh_target_reset_handler,
-	.slave_alloc			= sas_slave_alloc,
-	.target_destroy			= sas_target_destroy,
-	.ioctl				= sas_ioctl,
-#ifdef CONFIG_COMPAT
-	.compat_ioctl			= sas_ioctl,
-#endif
-	.shost_attrs			= isci_host_attrs,
+	.eh_abort_handler               = sas_eh_abort_handler,
+	.shost_groups			= isci_host_groups,
+	.sdev_groups			= isci_sdev_groups,
 	.track_queue_depth		= 1,
 };
 
@@ -244,7 +233,6 @@ static int isci_register_sas_ha(struct isci_host *isci_host)
 		return -ENOMEM;
 
 	sas_ha->sas_ha_name = DRV_NAME;
-	sas_ha->lldd_module = THIS_MODULE;
 	sas_ha->sas_addr    = &isci_host->phys[0].sas_addr[0];
 
 	for (i = 0; i < SCI_MAX_PHYS; i++) {
@@ -258,9 +246,7 @@ static int isci_register_sas_ha(struct isci_host *isci_host)
 
 	sas_ha->strict_wide_ports = 1;
 
-	sas_register_ha(sas_ha);
-
-	return 0;
+	return sas_register_ha(sas_ha);
 }
 
 static void isci_unregister(struct isci_host *isci_host)
@@ -569,7 +555,7 @@ static struct isci_host *isci_host_alloc(struct pci_dev *pdev, int id)
 		goto err_shost;
 
 	SHOST_TO_SAS_HA(shost) = &ihost->sas_ha;
-	ihost->sas_ha.core.shost = shost;
+	ihost->sas_ha.shost = shost;
 	shost->transportt = isci_transport_template;
 
 	shost->max_id = ~0;
@@ -724,7 +710,7 @@ static int isci_resume(struct device *dev)
 		sas_prep_resume_ha(&ihost->sas_ha);
 
 		isci_host_init(ihost);
-		isci_host_start(ihost->sas_ha.core.shost);
+		isci_host_start(ihost->sas_ha.shost);
 		wait_for_start(ihost);
 
 		sas_resume_ha(&ihost->sas_ha);
@@ -768,6 +754,7 @@ static __exit void isci_exit(void)
 	sas_release_transport(isci_transport_template);
 }
 
+MODULE_DESCRIPTION("Intel(R) C600 Series Chipset SAS Controller driver");
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_FIRMWARE(ISCI_FW_NAME);
 module_init(isci_init);

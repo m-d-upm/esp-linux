@@ -5,7 +5,9 @@
 /* Interrupts/Exceptions */
 #include <asm/trapnr.h>
 
-#ifndef __ASSEMBLY__
+#define IDT_ALIGN	(8 * (1 + HAS_KERNEL_IBT))
+
+#ifndef __ASSEMBLER__
 #include <linux/entry-common.h>
 #include <linux/hardirq.h>
 
@@ -457,7 +459,17 @@ __visible noinstr void func(struct pt_regs *regs,			\
 #define DEFINE_FREDENTRY_DEBUG		DEFINE_FREDENTRY_RAW
 #endif
 
-#else /* !__ASSEMBLY__ */
+void idt_install_sysvec(unsigned int n, const void *function);
+void fred_install_sysvec(unsigned int vector, const idtentry_t function);
+
+#define sysvec_install(vector, function) {				\
+	if (IS_ENABLED(CONFIG_X86_FRED))				\
+		fred_install_sysvec(vector, function);			\
+	if (!cpu_feature_enabled(X86_FEATURE_FRED))			\
+		idt_install_sysvec(vector, asm_##function);		\
+}
+
+#else /* !__ASSEMBLER__ */
 
 /*
  * The ASM variants for DECLARE_IDTENTRY*() which emit the ASM entry stubs.
@@ -483,7 +495,7 @@ __visible noinstr void func(struct pt_regs *regs,			\
 
 /* System vector entries */
 #define DECLARE_IDTENTRY_SYSVEC(vector, func)				\
-	idtentry_sysvec vector func
+	DECLARE_IDTENTRY(vector, func)
 
 #ifdef CONFIG_X86_64
 # define DECLARE_IDTENTRY_MCE(vector, func)				\
@@ -518,7 +530,7 @@ __visible noinstr void func(struct pt_regs *regs,			\
 
 /*
  * ASM code to emit the common vector entry stubs where each stub is
- * packed into 8 bytes.
+ * packed into IDT_ALIGN bytes.
  *
  * Note, that the 'pushq imm8' is emitted via '.byte 0x6a, vector' because
  * GCC treats the local vector variable as unsigned int and would expand
@@ -530,39 +542,39 @@ __visible noinstr void func(struct pt_regs *regs,			\
  * point is to mask off the bits above bit 7 because the push is sign
  * extending.
  */
-	.align 8
+	.align IDT_ALIGN
 SYM_CODE_START(irq_entries_start)
     vector=FIRST_EXTERNAL_VECTOR
     .rept NR_EXTERNAL_VECTORS
 	UNWIND_HINT_IRET_REGS
 0 :
+	ENDBR
 	.byte	0x6a, vector
 	jmp	asm_common_interrupt
-	nop
-	/* Ensure that the above is 8 bytes max */
-	. = 0b + 8
+	/* Ensure that the above is IDT_ALIGN bytes max */
+	.fill 0b + IDT_ALIGN - ., 1, 0xcc
 	vector = vector+1
     .endr
 SYM_CODE_END(irq_entries_start)
 
 #ifdef CONFIG_X86_LOCAL_APIC
-	.align 8
+	.align IDT_ALIGN
 SYM_CODE_START(spurious_entries_start)
     vector=FIRST_SYSTEM_VECTOR
     .rept NR_SYSTEM_VECTORS
 	UNWIND_HINT_IRET_REGS
 0 :
+	ENDBR
 	.byte	0x6a, vector
 	jmp	asm_spurious_interrupt
-	nop
-	/* Ensure that the above is 8 bytes max */
-	. = 0b + 8
+	/* Ensure that the above is IDT_ALIGN bytes max */
+	.fill 0b + IDT_ALIGN - ., 1, 0xcc
 	vector = vector+1
     .endr
 SYM_CODE_END(spurious_entries_start)
 #endif
 
-#endif /* __ASSEMBLY__ */
+#endif /* __ASSEMBLER__ */
 
 /*
  * The actual entry points. Note that DECLARE_IDTENTRY*() serves two
@@ -605,6 +617,10 @@ DECLARE_IDTENTRY_RAW(X86_TRAP_UD,		exc_invalid_op);
 DECLARE_IDTENTRY_RAW(X86_TRAP_BP,		exc_int3);
 DECLARE_IDTENTRY_RAW_ERRORCODE(X86_TRAP_PF,	exc_page_fault);
 
+#if defined(CONFIG_IA32_EMULATION)
+DECLARE_IDTENTRY_RAW(IA32_SYSCALL_VECTOR,	int80_emulation);
+#endif
+
 #ifdef CONFIG_X86_MCE
 #ifdef CONFIG_X86_64
 DECLARE_IDTENTRY_MCE(X86_TRAP_MC,	exc_machine_check);
@@ -618,18 +634,14 @@ DECLARE_IDTENTRY_RAW(X86_TRAP_MC,	xenpv_exc_machine_check);
 
 /* NMI */
 
-#if defined(CONFIG_X86_64) && IS_ENABLED(CONFIG_KVM_INTEL)
+#if IS_ENABLED(CONFIG_KVM_INTEL)
 /*
- * Special NOIST entry point for VMX which invokes this on the kernel
- * stack. asm_exc_nmi() requires an IST to work correctly vs. the NMI
- * 'executing' marker.
- *
- * On 32bit this just uses the regular NMI entry point because 32-bit does
- * not have ISTs.
+ * Special entry point for VMX which invokes this on the kernel stack, even for
+ * 64-bit, i.e. without using an IST.  asm_exc_nmi() requires an IST to work
+ * correctly vs. the NMI 'executing' marker.  Used for 32-bit kernels as well
+ * to avoid more ifdeffery.
  */
-DECLARE_IDTENTRY(X86_TRAP_NMI,		exc_nmi_noist);
-#else
-#define asm_exc_nmi_noist		asm_exc_nmi
+DECLARE_IDTENTRY(X86_TRAP_NMI,		exc_nmi_kvm_vmx);
 #endif
 
 DECLARE_IDTENTRY_NMI(X86_TRAP_NMI,	exc_nmi);
@@ -653,6 +665,11 @@ DECLARE_IDTENTRY_DF(X86_TRAP_DF,	exc_double_fault);
 DECLARE_IDTENTRY_RAW_ERRORCODE(X86_TRAP_DF,	xenpv_exc_double_fault);
 #endif
 
+/* #CP */
+#ifdef CONFIG_X86_CET
+DECLARE_IDTENTRY_ERRORCODE(X86_TRAP_CP,	exc_control_protection);
+#endif
+
 /* #VC */
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 DECLARE_IDTENTRY_VC(X86_TRAP_VC,	exc_vmm_communication);
@@ -661,6 +678,10 @@ DECLARE_IDTENTRY_VC(X86_TRAP_VC,	exc_vmm_communication);
 #ifdef CONFIG_XEN_PV
 DECLARE_IDTENTRY_XENCB(X86_TRAP_OTHER,	exc_xen_hypervisor_callback);
 DECLARE_IDTENTRY_RAW(X86_TRAP_OTHER,	exc_xen_unknown_trap);
+#endif
+
+#ifdef CONFIG_INTEL_TDX_GUEST
+DECLARE_IDTENTRY(X86_TRAP_VE,		exc_virtualization_exception);
 #endif
 
 /* Device interrupts common/spurious */
@@ -679,7 +700,6 @@ DECLARE_IDTENTRY_SYSVEC(X86_PLATFORM_IPI_VECTOR,	sysvec_x86_platform_ipi);
 
 #ifdef CONFIG_SMP
 DECLARE_IDTENTRY(RESCHEDULE_VECTOR,			sysvec_reschedule_ipi);
-DECLARE_IDTENTRY_SYSVEC(IRQ_MOVE_CLEANUP_VECTOR,	sysvec_irq_move_cleanup);
 DECLARE_IDTENTRY_SYSVEC(REBOOT_VECTOR,			sysvec_reboot);
 DECLARE_IDTENTRY_SYSVEC(CALL_FUNCTION_SINGLE_VECTOR,	sysvec_call_function_single);
 DECLARE_IDTENTRY_SYSVEC(CALL_FUNCTION_VECTOR,		sysvec_call_function);
@@ -716,7 +736,7 @@ DECLARE_IDTENTRY_SYSVEC(IRQ_WORK_VECTOR,		sysvec_irq_work);
 # endif
 #endif
 
-#ifdef CONFIG_HAVE_KVM
+#if IS_ENABLED(CONFIG_KVM)
 DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_VECTOR,		sysvec_kvm_posted_intr_ipi);
 DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_WAKEUP_VECTOR,	sysvec_kvm_posted_intr_wakeup_ipi);
 DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_NESTED_VECTOR,	sysvec_kvm_posted_intr_nested_ipi);
@@ -725,6 +745,12 @@ DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_NESTED_VECTOR,	sysvec_kvm_posted_intr_nested
 # define fred_sysvec_kvm_posted_intr_wakeup_ipi		NULL
 # define fred_sysvec_kvm_posted_intr_nested_ipi		NULL
 #endif
+
+# ifdef CONFIG_X86_POSTED_MSI
+DECLARE_IDTENTRY_SYSVEC(POSTED_MSI_NOTIFICATION_VECTOR,	sysvec_posted_msi_notification);
+#else
+# define fred_sysvec_posted_msi_notification		NULL
+# endif
 
 #if IS_ENABLED(CONFIG_HYPERV)
 DECLARE_IDTENTRY_SYSVEC(HYPERVISOR_CALLBACK_VECTOR,	sysvec_hyperv_callback);

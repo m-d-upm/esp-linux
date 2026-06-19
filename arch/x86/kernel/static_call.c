@@ -2,7 +2,6 @@
 #include <linux/static_call.h>
 #include <linux/memory.h>
 #include <linux/bug.h>
-#include <asm/sync_core.h>
 #include <asm/text-patching.h>
 
 enum insn_type {
@@ -64,6 +63,7 @@ static void __ref __static_call_transform(void *insn, enum insn_type type,
 
 	switch (type) {
 	case CALL:
+		func = callthunks_translate_call_dest(func);
 		code = text_gen_insn(CALL_INSN_OPCODE, insn, func);
 		if (func == &__static_call_return0) {
 			emulate = code;
@@ -90,7 +90,7 @@ static void __ref __static_call_transform(void *insn, enum insn_type type,
 	case JCC:
 		if (!func) {
 			func = __static_call_return;
-			if (cpu_feature_enabled(X86_FEATURE_RETHUNK))
+			if (cpu_wants_rethunk())
 				func = x86_return_thunk;
 		}
 
@@ -108,12 +108,17 @@ static void __ref __static_call_transform(void *insn, enum insn_type type,
 	if (system_state == SYSTEM_BOOTING || modinit)
 		return text_poke_early(insn, code, size);
 
-	text_poke_bp(insn, code, size, emulate);
+	smp_text_poke_single(insn, code, size, emulate);
 }
 
-static void __static_call_validate(u8 *insn, bool tail)
+static void __static_call_validate(u8 *insn, bool tail, bool tramp)
 {
 	u8 opcode = insn[0];
+
+	if (tramp && memcmp(insn+5, tramp_ud, 3)) {
+		pr_err("trampoline signature fail");
+		BUG();
+	}
 
 	if (tail) {
 		if (opcode == JMP32_INSN_OPCODE ||
@@ -130,7 +135,8 @@ static void __static_call_validate(u8 *insn, bool tail)
 	/*
 	 * If we ever trigger this, our text is corrupt, we'll probably not live long.
 	 */
-	WARN_ONCE(1, "unexpected static_call insn opcode 0x%x at %pS\n", opcode, insn);
+	pr_err("unexpected static_call insn opcode 0x%x at %pS\n", opcode, insn);
+	BUG();
 }
 
 static inline enum insn_type __sc_insn(bool null, bool tail)
@@ -152,13 +158,13 @@ void arch_static_call_transform(void *site, void *tramp, void *func, bool tail)
 {
 	mutex_lock(&text_mutex);
 
-	if (tramp) {
-		__static_call_validate(tramp, true);
+	if (tramp && !site) {
+		__static_call_validate(tramp, true, true);
 		__static_call_transform(tramp, __sc_insn(!func, true), func, false);
 	}
 
 	if (IS_ENABLED(CONFIG_HAVE_STATIC_CALL_INLINE) && site) {
-		__static_call_validate(site, tail);
+		__static_call_validate(site, tail, false);
 		__static_call_transform(site, __sc_insn(!func, tail), func, false);
 	}
 
@@ -174,7 +180,7 @@ noinstr void __static_call_update_early(void *tramp, void *func)
 	sync_core();
 }
 
-#ifdef CONFIG_RETHUNK
+#ifdef CONFIG_MITIGATION_RETHUNK
 /*
  * This is called by apply_returns() to fix up static call trampolines,
  * specifically ARCH_DEFINE_STATIC_CALL_NULL_TRAMP which is recorded as

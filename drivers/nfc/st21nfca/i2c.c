@@ -11,7 +11,6 @@
 #include <linux/i2c.h>
 #include <linux/gpio/consumer.h>
 #include <linux/of_irq.h>
-#include <linux/of_gpio.h>
 #include <linux/acpi.h>
 #include <linux/interrupt.h>
 #include <linux/delay.h>
@@ -315,10 +314,8 @@ static int st21nfca_hci_i2c_repack(struct sk_buff *skb)
 		skb_pull(skb, 1);
 
 		r = check_crc(skb->data, skb->len);
-		if (r != 0) {
-			i = 0;
+		if (r != 0)
 			return -EBADMSG;
-		}
 
 		/* remove headbyte */
 		skb_pull(skb, 1);
@@ -421,7 +418,6 @@ static int st21nfca_hci_i2c_read(struct st21nfca_i2c_phy *phy,
 static irqreturn_t st21nfca_hci_irq_thread_fn(int irq, void *phy_id)
 {
 	struct st21nfca_i2c_phy *phy = phy_id;
-	struct i2c_client *client;
 
 	int r;
 
@@ -429,9 +425,6 @@ static irqreturn_t st21nfca_hci_irq_thread_fn(int irq, void *phy_id)
 		WARN_ON_ONCE(1);
 		return IRQ_NONE;
 	}
-
-	client = phy->i2c_dev;
-	dev_dbg(&client->dev, "IRQ\n");
 
 	if (phy->hard_fault != 0)
 		return IRQ_HANDLED;
@@ -493,8 +486,7 @@ static const struct acpi_gpio_mapping acpi_st21nfca_gpios[] = {
 	{},
 };
 
-static int st21nfca_hci_i2c_probe(struct i2c_client *client,
-				  const struct i2c_device_id *id)
+static int st21nfca_hci_i2c_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct st21nfca_i2c_phy *phy;
@@ -568,7 +560,7 @@ out_free:
 	return r;
 }
 
-static int st21nfca_hci_i2c_remove(struct i2c_client *client)
+static void st21nfca_hci_i2c_remove(struct i2c_client *client)
 {
 	struct st21nfca_i2c_phy *phy = i2c_get_clientdata(client);
 
@@ -576,14 +568,11 @@ static int st21nfca_hci_i2c_remove(struct i2c_client *client)
 
 	if (phy->powered)
 		st21nfca_hci_i2c_disable(phy);
-	if (phy->pending_skb)
-		kfree_skb(phy->pending_skb);
-
-	return 0;
+	kfree_skb(phy->pending_skb);
 }
 
 static const struct i2c_device_id st21nfca_hci_i2c_id_table[] = {
-	{ST21NFCA_HCI_DRIVER_NAME, 0},
+	{ ST21NFCA_HCI_DRIVER_NAME },
 	{}
 };
 MODULE_DEVICE_TABLE(i2c, st21nfca_hci_i2c_id_table);

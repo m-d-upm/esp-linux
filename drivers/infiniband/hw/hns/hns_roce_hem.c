@@ -31,7 +31,6 @@
  * SOFTWARE.
  */
 
-#include <linux/platform_device.h>
 #include "hns_roce_device.h"
 #include "hns_roce_hem.h"
 #include "hns_roce_common.h"
@@ -79,7 +78,7 @@ bool hns_roce_check_whether_mhop(struct hns_roce_dev *hr_dev, u32 type)
 		return false;
 	}
 
-	return hop_num ? true : false;
+	return hop_num;
 }
 
 static bool hns_roce_check_hem_null(struct hns_roce_hem **hem, u64 hem_idx,
@@ -250,85 +249,44 @@ int hns_roce_calc_hem_mhop(struct hns_roce_dev *hr_dev,
 }
 
 static struct hns_roce_hem *hns_roce_alloc_hem(struct hns_roce_dev *hr_dev,
-					       int npages,
-					       unsigned long hem_alloc_size,
-					       gfp_t gfp_mask)
+					       unsigned long hem_alloc_size)
 {
-	struct hns_roce_hem_chunk *chunk = NULL;
 	struct hns_roce_hem *hem;
-	struct scatterlist *mem;
 	int order;
 	void *buf;
 
-	WARN_ON(gfp_mask & __GFP_HIGHMEM);
+	order = get_order(hem_alloc_size);
+	if (PAGE_SIZE << order != hem_alloc_size) {
+		dev_err(hr_dev->dev, "invalid hem_alloc_size: %lu!\n",
+			hem_alloc_size);
+		return NULL;
+	}
 
-	hem = kmalloc(sizeof(*hem),
-		      gfp_mask & ~(__GFP_HIGHMEM | __GFP_NOWARN));
+	hem = kmalloc(sizeof(*hem), GFP_KERNEL);
 	if (!hem)
 		return NULL;
 
-	INIT_LIST_HEAD(&hem->chunk_list);
+	buf = dma_alloc_coherent(hr_dev->dev, hem_alloc_size,
+				 &hem->dma, GFP_KERNEL);
+	if (!buf)
+		goto fail;
 
-	order = get_order(hem_alloc_size);
-
-	while (npages > 0) {
-		if (!chunk) {
-			chunk = kmalloc(sizeof(*chunk),
-				gfp_mask & ~(__GFP_HIGHMEM | __GFP_NOWARN));
-			if (!chunk)
-				goto fail;
-
-			sg_init_table(chunk->mem, HNS_ROCE_HEM_CHUNK_LEN);
-			chunk->npages = 0;
-			chunk->nsg = 0;
-			memset(chunk->buf, 0, sizeof(chunk->buf));
-			list_add_tail(&chunk->list, &hem->chunk_list);
-		}
-
-		while (1 << order > npages)
-			--order;
-
-		/*
-		 * Alloc memory one time. If failed, don't alloc small block
-		 * memory, directly return fail.
-		 */
-		mem = &chunk->mem[chunk->npages];
-		buf = dma_alloc_coherent(hr_dev->dev, PAGE_SIZE << order,
-				&sg_dma_address(mem), gfp_mask);
-		if (!buf)
-			goto fail;
-
-		chunk->buf[chunk->npages] = buf;
-		sg_dma_len(mem) = PAGE_SIZE << order;
-
-		++chunk->npages;
-		++chunk->nsg;
-		npages -= 1 << order;
-	}
+	hem->buf = buf;
+	hem->size = hem_alloc_size;
 
 	return hem;
 
 fail:
-	hns_roce_free_hem(hr_dev, hem);
+	kfree(hem);
 	return NULL;
 }
 
 void hns_roce_free_hem(struct hns_roce_dev *hr_dev, struct hns_roce_hem *hem)
 {
-	struct hns_roce_hem_chunk *chunk, *tmp;
-	int i;
-
 	if (!hem)
 		return;
 
-	list_for_each_entry_safe(chunk, tmp, &hem->chunk_list, list) {
-		for (i = 0; i < chunk->npages; ++i)
-			dma_free_coherent(hr_dev->dev,
-				   sg_dma_len(&chunk->mem[i]),
-				   chunk->buf[i],
-				   sg_dma_address(&chunk->mem[i]));
-		kfree(chunk);
-	}
+	dma_free_coherent(hr_dev->dev, hem->size, hem->buf, hem->dma);
 
 	kfree(hem);
 }
@@ -338,7 +296,7 @@ static int calc_hem_config(struct hns_roce_dev *hr_dev,
 			   struct hns_roce_hem_mhop *mhop,
 			   struct hns_roce_hem_index *index)
 {
-	struct ib_device *ibdev = &hr_dev->ib_dev;
+	struct device *dev = hr_dev->dev;
 	unsigned long mhop_obj = obj;
 	u32 l0_idx, l1_idx, l2_idx;
 	u32 chunk_ba_num;
@@ -369,14 +327,14 @@ static int calc_hem_config(struct hns_roce_dev *hr_dev,
 		index->buf = l0_idx;
 		break;
 	default:
-		ibdev_err(ibdev, "table %u not support mhop.hop_num = %u!\n",
-			  table->type, mhop->hop_num);
+		dev_err(dev, "table %u not support mhop.hop_num = %u!\n",
+			table->type, mhop->hop_num);
 		return -EINVAL;
 	}
 
 	if (unlikely(index->buf >= table->num_hem)) {
-		ibdev_err(ibdev, "table %u exceed hem limt idx %llu, max %lu!\n",
-			  table->type, index->buf, table->num_hem);
+		dev_err(dev, "table %u exceed hem limt idx %llu, max %lu!\n",
+			table->type, index->buf, table->num_hem);
 		return -EINVAL;
 	}
 
@@ -416,8 +374,6 @@ static int alloc_mhop_hem(struct hns_roce_dev *hr_dev,
 {
 	u32 bt_size = mhop->bt_chunk_size;
 	struct device *dev = hr_dev->dev;
-	struct hns_roce_hem_iter iter;
-	gfp_t flag;
 	u64 bt_ba;
 	u32 size;
 	int ret;
@@ -456,17 +412,15 @@ static int alloc_mhop_hem(struct hns_roce_dev *hr_dev,
 	 * alloc bt space chunk for MTT/CQE.
 	 */
 	size = table->type < HEM_TYPE_MTT ? mhop->buf_chunk_size : bt_size;
-	flag = (table->lowmem ? GFP_KERNEL : GFP_HIGHUSER) | __GFP_NOWARN;
-	table->hem[index->buf] = hns_roce_alloc_hem(hr_dev, size >> PAGE_SHIFT,
-						    size, flag);
+	table->hem[index->buf] = hns_roce_alloc_hem(hr_dev, size);
 	if (!table->hem[index->buf]) {
 		ret = -ENOMEM;
 		goto err_alloc_hem;
 	}
 
 	index->inited |= HEM_INDEX_BUF;
-	hns_roce_hem_first(table->hem[index->buf], &iter);
-	bt_ba = hns_roce_hem_addr(&iter);
+	bt_ba = table->hem[index->buf]->dma;
+
 	if (table->type < HEM_TYPE_MTT) {
 		if (mhop->hop_num == 2)
 			*(table->bt_l1[index->l1] + mhop->l2_idx) = bt_ba;
@@ -488,14 +442,14 @@ static int set_mhop_hem(struct hns_roce_dev *hr_dev,
 			struct hns_roce_hem_mhop *mhop,
 			struct hns_roce_hem_index *index)
 {
-	struct ib_device *ibdev = &hr_dev->ib_dev;
-	int step_idx;
+	struct device *dev = hr_dev->dev;
+	u32 step_idx;
 	int ret = 0;
 
 	if (index->inited & HEM_INDEX_L0) {
 		ret = hr_dev->hw->set_hem(hr_dev, table, obj, 0);
 		if (ret) {
-			ibdev_err(ibdev, "set HEM step 0 failed!\n");
+			dev_err(dev, "set HEM step 0 failed!\n");
 			goto out;
 		}
 	}
@@ -503,7 +457,7 @@ static int set_mhop_hem(struct hns_roce_dev *hr_dev,
 	if (index->inited & HEM_INDEX_L1) {
 		ret = hr_dev->hw->set_hem(hr_dev, table, obj, 1);
 		if (ret) {
-			ibdev_err(ibdev, "set HEM step 1 failed!\n");
+			dev_err(dev, "set HEM step 1 failed!\n");
 			goto out;
 		}
 	}
@@ -515,7 +469,7 @@ static int set_mhop_hem(struct hns_roce_dev *hr_dev,
 			step_idx = mhop->hop_num;
 		ret = hr_dev->hw->set_hem(hr_dev, table, obj, step_idx);
 		if (ret)
-			ibdev_err(ibdev, "set HEM step last failed!\n");
+			dev_err(dev, "set HEM step last failed!\n");
 	}
 out:
 	return ret;
@@ -525,14 +479,14 @@ static int hns_roce_table_mhop_get(struct hns_roce_dev *hr_dev,
 				   struct hns_roce_hem_table *table,
 				   unsigned long obj)
 {
-	struct ib_device *ibdev = &hr_dev->ib_dev;
 	struct hns_roce_hem_index index = {};
 	struct hns_roce_hem_mhop mhop = {};
+	struct device *dev = hr_dev->dev;
 	int ret;
 
 	ret = calc_hem_config(hr_dev, table, obj, &mhop, &index);
 	if (ret) {
-		ibdev_err(ibdev, "calc hem config failed!\n");
+		dev_err(dev, "calc hem config failed!\n");
 		return ret;
 	}
 
@@ -544,7 +498,7 @@ static int hns_roce_table_mhop_get(struct hns_roce_dev *hr_dev,
 
 	ret = alloc_mhop_hem(hr_dev, table, &mhop, &index);
 	if (ret) {
-		ibdev_err(ibdev, "alloc mhop hem failed!\n");
+		dev_err(dev, "alloc mhop hem failed!\n");
 		goto out;
 	}
 
@@ -552,7 +506,7 @@ static int hns_roce_table_mhop_get(struct hns_roce_dev *hr_dev,
 	if (table->type < HEM_TYPE_MTT) {
 		ret = set_mhop_hem(hr_dev, table, obj, &mhop, &index);
 		if (ret) {
-			ibdev_err(ibdev, "set HEM address to HW failed!\n");
+			dev_err(dev, "set HEM address to HW failed!\n");
 			goto err_alloc;
 		}
 	}
@@ -586,11 +540,7 @@ int hns_roce_table_get(struct hns_roce_dev *hr_dev,
 		goto out;
 	}
 
-	table->hem[i] = hns_roce_alloc_hem(hr_dev,
-				       table->table_chunk_size >> PAGE_SHIFT,
-				       table->table_chunk_size,
-				       (table->lowmem ? GFP_KERNEL :
-					GFP_HIGHUSER) | __GFP_NOWARN);
+	table->hem[i] = hns_roce_alloc_hem(hr_dev, table->table_chunk_size);
 	if (!table->hem[i]) {
 		ret = -ENOMEM;
 		goto out;
@@ -617,10 +567,11 @@ static void clear_mhop_hem(struct hns_roce_dev *hr_dev,
 			   struct hns_roce_hem_mhop *mhop,
 			   struct hns_roce_hem_index *index)
 {
-	struct ib_device *ibdev = &hr_dev->ib_dev;
+	struct device *dev = hr_dev->dev;
 	u32 hop_num = mhop->hop_num;
 	u32 chunk_ba_num;
-	int step_idx;
+	u32 step_idx;
+	int ret;
 
 	index->inited = HEM_INDEX_BUF;
 	chunk_ba_num = mhop->bt_chunk_size / BA_BYTE_LEN;
@@ -644,16 +595,24 @@ static void clear_mhop_hem(struct hns_roce_dev *hr_dev,
 		else
 			step_idx = hop_num;
 
-		if (hr_dev->hw->clear_hem(hr_dev, table, obj, step_idx))
-			ibdev_warn(ibdev, "failed to clear hop%u HEM.\n", hop_num);
+		ret = hr_dev->hw->clear_hem(hr_dev, table, obj, step_idx);
+		if (ret)
+			dev_warn(dev, "failed to clear hop%u HEM, ret = %d.\n",
+				 hop_num, ret);
 
-		if (index->inited & HEM_INDEX_L1)
-			if (hr_dev->hw->clear_hem(hr_dev, table, obj, 1))
-				ibdev_warn(ibdev, "failed to clear HEM step 1.\n");
+		if (index->inited & HEM_INDEX_L1) {
+			ret = hr_dev->hw->clear_hem(hr_dev, table, obj, 1);
+			if (ret)
+				dev_warn(dev, "failed to clear HEM step 1, ret = %d.\n",
+					 ret);
+		}
 
-		if (index->inited & HEM_INDEX_L0)
-			if (hr_dev->hw->clear_hem(hr_dev, table, obj, 0))
-				ibdev_warn(ibdev, "failed to clear HEM step 0.\n");
+		if (index->inited & HEM_INDEX_L0) {
+			ret = hr_dev->hw->clear_hem(hr_dev, table, obj, 0);
+			if (ret)
+				dev_warn(dev, "failed to clear HEM step 0, ret = %d.\n",
+					 ret);
+		}
 	}
 }
 
@@ -662,14 +621,14 @@ static void hns_roce_table_mhop_put(struct hns_roce_dev *hr_dev,
 				    unsigned long obj,
 				    int check_refcount)
 {
-	struct ib_device *ibdev = &hr_dev->ib_dev;
 	struct hns_roce_hem_index index = {};
 	struct hns_roce_hem_mhop mhop = {};
+	struct device *dev = hr_dev->dev;
 	int ret;
 
 	ret = calc_hem_config(hr_dev, table, obj, &mhop, &index);
 	if (ret) {
-		ibdev_err(ibdev, "calc hem config failed!\n");
+		dev_err(dev, "calc hem config failed!\n");
 		return;
 	}
 
@@ -690,6 +649,7 @@ void hns_roce_table_put(struct hns_roce_dev *hr_dev,
 {
 	struct device *dev = hr_dev->dev;
 	unsigned long i;
+	int ret;
 
 	if (hns_roce_check_whether_mhop(hr_dev, table->type)) {
 		hns_roce_table_mhop_put(hr_dev, table, obj, 1);
@@ -702,8 +662,10 @@ void hns_roce_table_put(struct hns_roce_dev *hr_dev,
 					 &table->mutex))
 		return;
 
-	if (hr_dev->hw->clear_hem(hr_dev, table, obj, HEM_HOP_STEP_DIRECT))
-		dev_warn(dev, "failed to clear HEM base address.\n");
+	ret = hr_dev->hw->clear_hem(hr_dev, table, obj, HEM_HOP_STEP_DIRECT);
+	if (ret)
+		dev_warn_ratelimited(dev, "failed to clear HEM base address, ret = %d.\n",
+				     ret);
 
 	hns_roce_free_hem(hr_dev, table->hem[i]);
 	table->hem[i] = NULL;
@@ -715,7 +677,6 @@ void *hns_roce_table_find(struct hns_roce_dev *hr_dev,
 			  struct hns_roce_hem_table *table,
 			  unsigned long obj, dma_addr_t *dma_handle)
 {
-	struct hns_roce_hem_chunk *chunk;
 	struct hns_roce_hem_mhop mhop;
 	struct hns_roce_hem *hem;
 	unsigned long mhop_obj = obj;
@@ -724,11 +685,7 @@ void *hns_roce_table_find(struct hns_roce_dev *hr_dev,
 	int offset, dma_offset;
 	void *addr = NULL;
 	u32 hem_idx = 0;
-	int length;
 	int i, j;
-
-	if (!table->lowmem)
-		return NULL;
 
 	mutex_lock(&table->mutex);
 
@@ -760,23 +717,8 @@ void *hns_roce_table_find(struct hns_roce_dev *hr_dev,
 	if (!hem)
 		goto out;
 
-	list_for_each_entry(chunk, &hem->chunk_list, list) {
-		for (i = 0; i < chunk->npages; ++i) {
-			length = sg_dma_len(&chunk->mem[i]);
-			if (dma_handle && dma_offset >= 0) {
-				if (length > (u32)dma_offset)
-					*dma_handle = sg_dma_address(
-						&chunk->mem[i]) + dma_offset;
-				dma_offset -= length;
-			}
-
-			if (length > (u32)offset) {
-				addr = chunk->buf[i] + offset;
-				goto out;
-			}
-			offset -= length;
-		}
-	}
+	*dma_handle = hem->dma + dma_offset;
+	addr = hem->buf + offset;
 
 out:
 	mutex_unlock(&table->mutex);
@@ -785,8 +727,7 @@ out:
 
 int hns_roce_init_hem_table(struct hns_roce_dev *hr_dev,
 			    struct hns_roce_hem_table *table, u32 type,
-			    unsigned long obj_size, unsigned long nobj,
-			    int use_lowmem)
+			    unsigned long obj_size, unsigned long nobj)
 {
 	unsigned long obj_per_chunk;
 	unsigned long num_hem;
@@ -863,7 +804,6 @@ int hns_roce_init_hem_table(struct hns_roce_dev *hr_dev,
 	table->type = type;
 	table->num_hem = num_hem;
 	table->obj_size = obj_size;
-	table->lowmem = use_lowmem;
 	mutex_init(&table->mutex);
 
 	return 0;
@@ -924,21 +864,27 @@ void hns_roce_cleanup_hem_table(struct hns_roce_dev *hr_dev,
 {
 	struct device *dev = hr_dev->dev;
 	unsigned long i;
+	int obj;
+	int ret;
 
 	if (hns_roce_check_whether_mhop(hr_dev, table->type)) {
 		hns_roce_cleanup_mhop_hem_table(hr_dev, table);
+		mutex_destroy(&table->mutex);
 		return;
 	}
 
 	for (i = 0; i < table->num_hem; ++i)
 		if (table->hem[i]) {
-			if (hr_dev->hw->clear_hem(hr_dev, table,
-			    i * table->table_chunk_size / table->obj_size, 0))
-				dev_err(dev, "Clear HEM base address failed.\n");
+			obj = i * table->table_chunk_size / table->obj_size;
+			ret = hr_dev->hw->clear_hem(hr_dev, table, obj, 0);
+			if (ret)
+				dev_err(dev, "clear HEM base address failed, ret = %d.\n",
+					ret);
 
 			hns_roce_free_hem(hr_dev, table->hem[i]);
 		}
 
+	mutex_destroy(&table->mutex);
 	kfree(table->hem);
 }
 
@@ -1036,15 +982,13 @@ static void hem_list_free_all(struct hns_roce_dev *hr_dev,
 	}
 }
 
-static void hem_list_link_bt(struct hns_roce_dev *hr_dev, void *base_addr,
-			     u64 table_addr)
+static void hem_list_link_bt(void *base_addr, u64 table_addr)
 {
 	*(u64 *)(base_addr) = table_addr;
 }
 
 /* assign L0 table address to hem from root bt */
-static void hem_list_assign_bt(struct hns_roce_dev *hr_dev,
-			       struct hns_roce_hem_item *hem, void *cpu_addr,
+static void hem_list_assign_bt(struct hns_roce_hem_item *hem, void *cpu_addr,
 			       u64 phy_addr)
 {
 	hem->addr = cpu_addr;
@@ -1219,8 +1163,7 @@ static int hem_list_alloc_mid_bt(struct hns_roce_dev *hr_dev,
 		if (level > 1) {
 			pre = hem_ptrs[level - 1];
 			step = (cur->start - pre->start) / step * BA_BYTE_LEN;
-			hem_list_link_bt(hr_dev, pre->addr + step,
-					 cur->dma_addr);
+			hem_list_link_bt(pre->addr + step, cur->dma_addr);
 		}
 	}
 
@@ -1285,7 +1228,7 @@ static int alloc_fake_root_bt(struct hns_roce_dev *hr_dev, void *cpu_base,
 
 	/* The root_ba can be reused only when r->hopnum > 0. */
 	if (r->hopnum)
-		hem_list_assign_bt(hr_dev, hem, cpu_base, phy_base);
+		hem_list_assign_bt(hem, cpu_base, phy_base);
 	list_add(&hem->list, branch_head);
 	list_add(&hem->sibling, leaf_head);
 
@@ -1311,7 +1254,7 @@ static int setup_middle_bt(struct hns_roce_dev *hr_dev, void *cpu_base,
 	/* if exist mid bt, link L1 to L0 */
 	list_for_each_entry_safe(hem, temp_hem, branch_head, list) {
 		offset = (hem->start - r->offset) / step * BA_BYTE_LEN;
-		hem_list_link_bt(hr_dev, cpu_base + offset, hem->dma_addr);
+		hem_list_link_bt(cpu_base + offset, hem->dma_addr);
 		total++;
 	}
 
@@ -1450,7 +1393,7 @@ int hns_roce_hem_list_request(struct hns_roce_dev *hr_dev,
 						    &hem_list->btm_bt);
 			if (ret) {
 				dev_err(hr_dev->dev,
-					"alloc hem trunk fail ret=%d!\n", ret);
+					"alloc hem trunk fail ret = %d!\n", ret);
 				goto err_alloc;
 			}
 		}
@@ -1459,7 +1402,7 @@ int hns_roce_hem_list_request(struct hns_roce_dev *hr_dev,
 	ret = hem_list_alloc_root_bt(hr_dev, hem_list, unit, regions,
 				     region_cnt);
 	if (ret)
-		dev_err(hr_dev->dev, "alloc hem root fail ret=%d!\n", ret);
+		dev_err(hr_dev->dev, "alloc hem root fail ret = %d!\n", ret);
 	else
 		return 0;
 

@@ -14,9 +14,16 @@
 #include <linux/sched.h>
 #include <linux/thread_info.h>
 
+#ifdef CONFIG_ARCH_HAS_SYSCALL_WRAPPER
+typedef long (*syscall_fn)(const struct pt_regs *);
+#else
+typedef long (*syscall_fn)(unsigned long, unsigned long, unsigned long,
+			   unsigned long, unsigned long, unsigned long);
+#endif
+
 /* ftrace syscalls requires exporting the sys_call_table */
-extern const unsigned long sys_call_table[];
-extern const unsigned long compat_sys_call_table[];
+extern const syscall_fn sys_call_table[];
+extern const syscall_fn compat_sys_call_table[];
 
 static inline int syscall_get_nr(struct task_struct *task, struct pt_regs *regs)
 {
@@ -30,6 +37,16 @@ static inline int syscall_get_nr(struct task_struct *task, struct pt_regs *regs)
 		return regs->gpr[0];
 	else
 		return -1;
+}
+
+static inline void syscall_set_nr(struct task_struct *task, struct pt_regs *regs, int nr)
+{
+	/*
+	 * Unlike syscall_get_nr(), syscall_set_nr() can be called only when
+	 * the target task is stopped for tracing on entering syscall, so
+	 * there is no need to have the same check syscall_get_nr() has.
+	 */
+	regs->gpr[0] = nr;
 }
 
 static inline void syscall_rollback(struct task_struct *task,

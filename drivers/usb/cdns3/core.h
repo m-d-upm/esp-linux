@@ -8,11 +8,11 @@
  * Authors: Peter Chen <peter.chen@nxp.com>
  *          Pawel Laszczak <pawell@cadence.com>
  */
-#include <linux/usb/otg.h>
-#include <linux/usb/role.h>
-
 #ifndef __LINUX_CDNS3_CORE_H
 #define __LINUX_CDNS3_CORE_H
+
+#include <linux/usb/otg.h>
+#include <linux/usb/role.h>
 
 struct cdns;
 
@@ -30,7 +30,7 @@ struct cdns_role_driver {
 	int (*start)(struct cdns *cdns);
 	void (*stop)(struct cdns *cdns);
 	int (*suspend)(struct cdns *cdns, bool do_wakeup);
-	int (*resume)(struct cdns *cdns, bool hibernated);
+	int (*resume)(struct cdns *cdns, bool lost_power);
 	const char *name;
 #define CDNS_ROLE_STATE_INACTIVE	0
 #define CDNS_ROLE_STATE_ACTIVE		1

@@ -14,7 +14,7 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <linux/lzo.h>
 #include "lzodefs.h"
 
@@ -26,7 +26,7 @@
 #define HAVE_OP(x) 1
 #endif
 
-#define NEED_OP(x) if (!HAVE_OP(x)) goto output_overrun
+#define NEED_OP(x) if (unlikely(!HAVE_OP(x))) goto output_overrun
 
 static noinline int
 LZO_SAFE(lzo1x_1_do_compress)(const unsigned char *in, size_t in_len,
@@ -62,9 +62,7 @@ next:
 
 		if (dv == 0 && bitstream_version) {
 			const unsigned char *ir = ip + 4;
-			const unsigned char *limit = ip_end
-				< (ip + MAX_ZERO_RUN_LENGTH + 1)
-				? ip_end : ip + MAX_ZERO_RUN_LENGTH + 1;
+			const unsigned char *limit = min(ip_end, ip + MAX_ZERO_RUN_LENGTH + 1);
 #if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS) && \
 	defined(LZO_FAST_64BIT_MEMORY_ACCESS)
 			u64 dv64;
@@ -361,7 +359,7 @@ static int LZO_SAFE(lzogeneric1x_1_compress)(
 	data_start = op;
 
 	while (l > 20) {
-		size_t ll = l <= (m4_max_offset + 1) ? l : (m4_max_offset + 1);
+		size_t ll = min_t(size_t, l, m4_max_offset + 1);
 		uintptr_t ll_end = (uintptr_t) ip + ll;
 		int err;
 

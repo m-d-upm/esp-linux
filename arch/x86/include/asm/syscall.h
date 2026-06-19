@@ -38,6 +38,13 @@ static inline int syscall_get_nr(struct task_struct *task, struct pt_regs *regs)
 	return regs->orig_ax;
 }
 
+static inline void syscall_set_nr(struct task_struct *task,
+				  struct pt_regs *regs,
+				  int nr)
+{
+	regs->orig_ax = nr;
+}
+
 static inline void syscall_rollback(struct task_struct *task,
 				    struct pt_regs *regs)
 {
@@ -92,11 +99,14 @@ static inline void syscall_get_arguments(struct task_struct *task,
 
 static inline void syscall_set_arguments(struct task_struct *task,
 					 struct pt_regs *regs,
-					 unsigned int i, unsigned int n,
 					 const unsigned long *args)
 {
-	BUG_ON(i + n > 6);
-	memcpy(&regs->bx + i, args, n * sizeof(args[0]));
+	regs->bx = args[0];
+	regs->cx = args[1];
+	regs->dx = args[2];
+	regs->si = args[3];
+	regs->di = args[4];
+	regs->bp = args[5];
 }
 
 static inline int syscall_get_arch(struct task_struct *task)
@@ -162,10 +172,13 @@ static inline int syscall_get_arch(struct task_struct *task)
 		? AUDIT_ARCH_I386 : AUDIT_ARCH_X86_64;
 }
 
-void do_syscall_64(struct pt_regs *regs, int nr);
-void do_int80_syscall_32(struct pt_regs *regs);
-long do_fast_syscall_32(struct pt_regs *regs);
+bool do_syscall_64(struct pt_regs *regs, int nr);
+void do_int80_emulation(struct pt_regs *regs);
 
 #endif	/* CONFIG_X86_32 */
+
+void do_int80_syscall_32(struct pt_regs *regs);
+bool do_fast_syscall_32(struct pt_regs *regs);
+bool do_SYSENTER_32(struct pt_regs *regs);
 
 #endif	/* _ASM_X86_SYSCALL_H */

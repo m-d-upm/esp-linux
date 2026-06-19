@@ -13,7 +13,7 @@
 #include <linux/io.h>
 #include <linux/spinlock.h>
 #include <linux/device.h>
-#include <linux/of_device.h>
+#include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/libata.h>
@@ -386,7 +386,7 @@ static int highbank_initialize_phys(struct device *dev, void __iomem *addr)
 static int ahci_highbank_hardreset(struct ata_link *link, unsigned int *class,
 				unsigned long deadline)
 {
-	static const unsigned long timing[] = { 5, 100, 500};
+	static const unsigned int timing[] = { 5, 100, 500};
 	struct ata_port *ap = link->ap;
 	struct ahci_port_priv *pp = ap->private_data;
 	struct ahci_host_priv *hpriv = ap->host->private_data;
@@ -428,7 +428,7 @@ static int ahci_highbank_hardreset(struct ata_link *link, unsigned int *class,
 
 static struct ata_port_operations ahci_highbank_ops = {
 	.inherits		= &ahci_ops,
-	.hardreset		= ahci_highbank_hardreset,
+	.reset.hardreset	= ahci_highbank_hardreset,
 	.transmit_led_message   = ecx_transmit_led_message,
 };
 
@@ -439,13 +439,13 @@ static const struct ata_port_info ahci_highbank_port_info = {
 	.port_ops       = &ahci_highbank_ops,
 };
 
-static struct scsi_host_template ahci_highbank_platform_sht = {
+static const struct scsi_host_template ahci_highbank_platform_sht = {
 	AHCI_SHT("sata_highbank"),
 };
 
 static const struct of_device_id ahci_of_match[] = {
 	{ .compatible = "calxeda,hb-ahci" },
-	{},
+	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, ahci_of_match);
 
@@ -470,10 +470,8 @@ static int ahci_highbank_probe(struct platform_device *pdev)
 	}
 
 	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		dev_err(dev, "no irq\n");
+	if (irq < 0)
 		return irq;
-	}
 	if (!irq)
 		return -EINVAL;
 
@@ -590,7 +588,8 @@ static int ahci_highbank_suspend(struct device *dev)
 	writel(ctl, mmio + HOST_CTL);
 	readl(mmio + HOST_CTL); /* flush */
 
-	return ata_host_suspend(host, PMSG_SUSPEND);
+	ata_host_suspend(host, PMSG_SUSPEND);
+	return 0;
 }
 
 static int ahci_highbank_resume(struct device *dev)
@@ -617,11 +616,11 @@ static SIMPLE_DEV_PM_OPS(ahci_highbank_pm_ops,
 
 static struct platform_driver ahci_highbank_driver = {
 	.remove = ata_platform_remove_one,
-        .driver = {
-                .name = "highbank-ahci",
-                .of_match_table = ahci_of_match,
-                .pm = &ahci_highbank_pm_ops,
-        },
+	.driver = {
+		.name = "highbank-ahci",
+		.of_match_table = ahci_of_match,
+		.pm = &ahci_highbank_pm_ops,
+	},
 	.probe = ahci_highbank_probe,
 };
 

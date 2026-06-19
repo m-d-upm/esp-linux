@@ -26,6 +26,8 @@
  * for more details.
  *
  */
+
+#include <linux/export.h>
 #include <linux/fb.h>
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -34,6 +36,7 @@
 #include <video/of_videomode.h>
 #include <video/videomode.h>
 #include "../edid.h"
+#include <linux/string_choices.h>
 
 /*
  * EDID parser
@@ -318,9 +321,9 @@ static void get_dpms_capabilities(unsigned char flags,
 	if (flags & DPMS_STANDBY)
 		specs->dpms |= FB_DPMS_STANDBY;
 	DPRINTK("      DPMS: Active %s, Suspend %s, Standby %s\n",
-	       (flags & DPMS_ACTIVE_OFF) ? "yes" : "no",
-	       (flags & DPMS_SUSPEND)    ? "yes" : "no",
-	       (flags & DPMS_STANDBY)    ? "yes" : "no");
+	       str_yes_no(flags & DPMS_ACTIVE_OFF),
+	       str_yes_no(flags & DPMS_SUSPEND),
+	       str_yes_no(flags & DPMS_STANDBY));
 }
 
 static void get_chroma(unsigned char *block, struct fb_monspecs *specs)
@@ -1050,7 +1053,7 @@ static u32 fb_get_vblank(u32 hfreq)
 }
 
 /**
- * fb_get_hblank_by_freq - get horizontal blank time given hfreq
+ * fb_get_hblank_by_hfreq - get horizontal blank time given hfreq
  * @hfreq: horizontal freq
  * @xres: horizontal resolution in pixels
  *
@@ -1482,13 +1485,12 @@ int fb_validate_mode(const struct fb_var_screeninfo *var, struct fb_info *info)
 		-EINVAL : 0;
 }
 
-#if defined(CONFIG_FIRMWARE_EDID) && defined(CONFIG_X86)
-
 /*
  * We need to ensure that the EDID block is only returned for
  * the primary graphics adapter.
  */
 
+#if defined(CONFIG_FIRMWARE_EDID)
 const unsigned char *fb_firmware_edid(struct device *device)
 {
 	struct pci_dev *dev = NULL;

@@ -25,7 +25,6 @@
  * 1) Add mechanism to deal with reverse congestion.
  */
 
-#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/math64.h>
 #include <net/tcp.h>
@@ -397,8 +396,8 @@ static void tcpnv_acked(struct sock *sk, const struct ack_sample *sample)
 
 			/* We have enough data to determine we are congested */
 			ca->nv_allow_cwnd_growth = 0;
-			tp->snd_ssthresh =
-				(nv_ssthresh_factor * max_win) >> 3;
+			WRITE_ONCE(tp->snd_ssthresh,
+				   (nv_ssthresh_factor * max_win) >> 3);
 			if (tcp_snd_cwnd(tp) - max_win > 2) {
 				/* gap > 2, we do exponential cwnd decrease */
 				int dec;

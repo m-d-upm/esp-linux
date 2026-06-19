@@ -33,8 +33,7 @@
  * TODO: allocating a new gem(in qxl_bo) for each request.
  * This is wasteful since bo's are page aligned.
  */
-static int qxl_alloc_ioctl(struct drm_device *dev, void *data,
-			   struct drm_file *file_priv)
+int qxl_alloc_ioctl(struct drm_device *dev, void *data, struct drm_file *file_priv)
 {
 	struct qxl_device *qdev = to_qxl(dev);
 	struct drm_qxl_alloc *qxl_alloc = data;
@@ -60,8 +59,7 @@ static int qxl_alloc_ioctl(struct drm_device *dev, void *data,
 	return 0;
 }
 
-static int qxl_map_ioctl(struct drm_device *dev, void *data,
-			 struct drm_file *file_priv)
+int qxl_map_ioctl(struct drm_device *dev, void *data, struct drm_file *file_priv)
 {
 	struct qxl_device *qdev = to_qxl(dev);
 	struct drm_qxl_map *qxl_map = data;
@@ -147,7 +145,7 @@ static int qxl_process_single_command(struct qxl_device *qdev,
 	struct qxl_release *release;
 	struct qxl_bo *cmd_bo;
 	void *fb_cmd;
-	int i, ret, num_relocs;
+	int i, ret;
 	int unwritten;
 
 	switch (cmd->type) {
@@ -184,7 +182,7 @@ static int qxl_process_single_command(struct qxl_device *qdev,
 
 	/* TODO copy slow path code from i915 */
 	fb_cmd = qxl_bo_kmap_atomic_page(qdev, cmd_bo, (release->release_offset & PAGE_MASK));
-	unwritten = __copy_from_user_inatomic_nocache
+	unwritten = copy_from_user_inatomic_nontemporal
 		(fb_cmd + sizeof(union qxl_release_info) + (release->release_offset & ~PAGE_MASK),
 		 u64_to_user_ptr(cmd->command), cmd->command_size);
 
@@ -202,7 +200,6 @@ static int qxl_process_single_command(struct qxl_device *qdev,
 	}
 
 	/* fill out reloc info structs */
-	num_relocs = 0;
 	for (i = 0; i < cmd->relocs_num; ++i) {
 		struct drm_qxl_reloc reloc;
 		struct drm_qxl_reloc __user *u = u64_to_user_ptr(cmd->relocs);
@@ -232,7 +229,6 @@ static int qxl_process_single_command(struct qxl_device *qdev,
 			reloc_info[i].dst_bo = cmd_bo;
 			reloc_info[i].dst_offset = reloc.dst_offset + release->release_offset;
 		}
-		num_relocs++;
 
 		/* reserve and validate the reloc dst bo */
 		if (reloc.reloc_type == QXL_RELOC_TYPE_BO || reloc.src_handle) {
@@ -271,8 +267,7 @@ out_free_reloc:
 	return ret;
 }
 
-static int qxl_execbuffer_ioctl(struct drm_device *dev, void *data,
-				struct drm_file *file_priv)
+int qxl_execbuffer_ioctl(struct drm_device *dev, void *data, struct drm_file *file_priv)
 {
 	struct qxl_device *qdev = to_qxl(dev);
 	struct drm_qxl_execbuffer *execbuffer = data;
@@ -296,8 +291,7 @@ static int qxl_execbuffer_ioctl(struct drm_device *dev, void *data,
 	return 0;
 }
 
-static int qxl_update_area_ioctl(struct drm_device *dev, void *data,
-				 struct drm_file *file)
+int qxl_update_area_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
 {
 	struct qxl_device *qdev = to_qxl(dev);
 	struct drm_qxl_update_area *update_area = data;
@@ -346,8 +340,7 @@ out:
 	return ret;
 }
 
-static int qxl_getparam_ioctl(struct drm_device *dev, void *data,
-		       struct drm_file *file_priv)
+int qxl_getparam_ioctl(struct drm_device *dev, void *data, struct drm_file *file_priv)
 {
 	struct qxl_device *qdev = to_qxl(dev);
 	struct drm_qxl_getparam *param = data;
@@ -365,8 +358,7 @@ static int qxl_getparam_ioctl(struct drm_device *dev, void *data,
 	return 0;
 }
 
-static int qxl_clientcap_ioctl(struct drm_device *dev, void *data,
-				  struct drm_file *file_priv)
+int qxl_clientcap_ioctl(struct drm_device *dev, void *data, struct drm_file *file_priv)
 {
 	struct qxl_device *qdev = to_qxl(dev);
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
@@ -387,8 +379,7 @@ static int qxl_clientcap_ioctl(struct drm_device *dev, void *data,
 	return -ENOSYS;
 }
 
-static int qxl_alloc_surf_ioctl(struct drm_device *dev, void *data,
-				struct drm_file *file)
+int qxl_alloc_surf_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
 {
 	struct qxl_device *qdev = to_qxl(dev);
 	struct drm_qxl_alloc_surf *param = data;
@@ -420,23 +411,3 @@ static int qxl_alloc_surf_ioctl(struct drm_device *dev, void *data,
 		param->handle = handle;
 	return ret;
 }
-
-const struct drm_ioctl_desc qxl_ioctls[] = {
-	DRM_IOCTL_DEF_DRV(QXL_ALLOC, qxl_alloc_ioctl, DRM_AUTH),
-
-	DRM_IOCTL_DEF_DRV(QXL_MAP, qxl_map_ioctl, DRM_AUTH),
-
-	DRM_IOCTL_DEF_DRV(QXL_EXECBUFFER, qxl_execbuffer_ioctl,
-							DRM_AUTH),
-	DRM_IOCTL_DEF_DRV(QXL_UPDATE_AREA, qxl_update_area_ioctl,
-							DRM_AUTH),
-	DRM_IOCTL_DEF_DRV(QXL_GETPARAM, qxl_getparam_ioctl,
-							DRM_AUTH),
-	DRM_IOCTL_DEF_DRV(QXL_CLIENTCAP, qxl_clientcap_ioctl,
-							DRM_AUTH),
-
-	DRM_IOCTL_DEF_DRV(QXL_ALLOC_SURF, qxl_alloc_surf_ioctl,
-			  DRM_AUTH),
-};
-
-int qxl_max_ioctls = ARRAY_SIZE(qxl_ioctls);

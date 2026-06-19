@@ -11,9 +11,15 @@
 
 #define CAN_SYNC_SEG 1
 
+#define CAN_BITRATE_UNSET 0
+#define CAN_BITRATE_UNKNOWN (-1U)
 
-#define CAN_CTRLMODE_TDC_MASK					\
+#define CAN_CTRLMODE_FD_TDC_MASK				\
 	(CAN_CTRLMODE_TDC_AUTO | CAN_CTRLMODE_TDC_MANUAL)
+#define CAN_CTRLMODE_TDC_AUTO_MASK				\
+	(CAN_CTRLMODE_TDC_AUTO)
+#define CAN_CTRLMODE_TDC_MANUAL_MASK				\
+	(CAN_CTRLMODE_TDC_MANUAL)
 
 /*
  * struct can_tdc - CAN FD Transmission Delay Compensation parameters
@@ -24,8 +30,8 @@
  *
  * To solve this issue, ISO 11898-1 introduces in section 11.3.3
  * "Transmitter delay compensation" a SSP (Secondary Sample Point)
- * equal to the distance, in time quanta, from the start of the bit
- * time on the TX pin to the actual measurement on the RX pin.
+ * equal to the distance from the start of the bit time on the TX pin
+ * to the actual measurement on the RX pin.
  *
  * This structure contains the parameters to calculate that SSP.
  *
@@ -37,8 +43,13 @@
  *                           |<------- TDCO ------->|
  *  |<----------- Secondary Sample Point ---------->|
  *
+ * To increase precision, contrary to the other bittiming parameters
+ * which are measured in time quanta, the TDC parameters are measured
+ * in clock periods (also referred as "minimum time quantum" in ISO
+ * 11898-1).
+ *
  * @tdcv: Transmitter Delay Compensation Value. The time needed for
- *	the signal to propagate, i.e. the distance, in time quanta,
+ *	the signal to propagate, i.e. the distance, in clock periods,
  *	from the start of the bit on the TX pin to when it is received
  *	on the RX pin. @tdcv depends on the controller modes:
  *
@@ -55,17 +66,18 @@
  *	TDC is disabled and all the values of this structure should be
  *	ignored.
  *
- * @tdco: Transmitter Delay Compensation Offset. Offset value, in time
- *	quanta, defining the distance between the start of the bit
- *	reception on the RX pin of the transceiver and the SSP
+ * @tdco: Transmitter Delay Compensation Offset. Offset value, in
+ *	clock periods, defining the distance between the start of the
+ *	bit reception on the RX pin of the transceiver and the SSP
  *	position such that SSP = @tdcv + @tdco.
  *
  * @tdcf: Transmitter Delay Compensation Filter window. Defines the
- *	minimum value for the SSP position in time quanta. If the SSP
- *	position is less than @tdcf, then no delay compensations occur
- *	and the normal sampling point is used instead. The feature is
- *	enabled if and only if @tdcv is set to zero (automatic mode)
- *	and @tdcf is configured to a value greater than @tdco.
+ *	minimum value for the SSP position in clock periods. If the
+ *	SSP position is less than @tdcf, then no delay compensations
+ *	occur and the normal sampling point is used instead. The
+ *	feature is enabled if and only if @tdcv is set to zero
+ *	(automatic mode) and @tdcf is configured to a value greater
+ *	than @tdco.
  */
 struct can_tdc {
 	u32 tdcv;
@@ -106,29 +118,80 @@ struct can_tdc_const {
 	u32 tdcf_max;
 };
 
-#ifdef CONFIG_CAN_CALC_BITTIMING
-int can_calc_bittiming(struct net_device *dev, struct can_bittiming *bt,
-		       const struct can_bittiming_const *btc);
+struct data_bittiming_params {
+	const struct can_bittiming_const *data_bittiming_const;
+	struct can_bittiming data_bittiming;
+	const struct can_tdc_const *tdc_const;
+	struct can_tdc tdc;
+	const u32 *data_bitrate_const;
+	unsigned int data_bitrate_const_cnt;
+	int (*do_set_data_bittiming)(struct net_device *dev);
+	int (*do_get_auto_tdcv)(const struct net_device *dev, u32 *tdcv);
+};
 
-void can_calc_tdco(struct net_device *dev);
+#ifdef CONFIG_CAN_CALC_BITTIMING
+int can_calc_bittiming(const struct net_device *dev, struct can_bittiming *bt,
+		       const struct can_bittiming_const *btc, struct netlink_ext_ack *extack);
+
+void can_calc_tdco(struct can_tdc *tdc, const struct can_tdc_const *tdc_const,
+		   const struct can_bittiming *dbt,
+		   u32 tdc_mask, u32 *ctrlmode, u32 ctrlmode_supported);
 #else /* !CONFIG_CAN_CALC_BITTIMING */
 static inline int
-can_calc_bittiming(struct net_device *dev, struct can_bittiming *bt,
-		   const struct can_bittiming_const *btc)
+can_calc_bittiming(const struct net_device *dev, struct can_bittiming *bt,
+		   const struct can_bittiming_const *btc, struct netlink_ext_ack *extack)
 {
 	netdev_err(dev, "bit-timing calculation not available\n");
 	return -EINVAL;
 }
 
-static inline void can_calc_tdco(struct net_device *dev)
+static inline void
+can_calc_tdco(struct can_tdc *tdc, const struct can_tdc_const *tdc_const,
+	      const struct can_bittiming *dbt,
+	      u32 tdc_mask, u32 *ctrlmode, u32 ctrlmode_supported)
 {
 }
 #endif /* CONFIG_CAN_CALC_BITTIMING */
 
-int can_get_bittiming(struct net_device *dev, struct can_bittiming *bt,
+void can_sjw_set_default(struct can_bittiming *bt);
+
+int can_sjw_check(const struct net_device *dev, const struct can_bittiming *bt,
+		  const struct can_bittiming_const *btc, struct netlink_ext_ack *extack);
+
+int can_get_bittiming(const struct net_device *dev, struct can_bittiming *bt,
 		      const struct can_bittiming_const *btc,
 		      const u32 *bitrate_const,
-		      const unsigned int bitrate_const_cnt);
+		      const unsigned int bitrate_const_cnt,
+		      struct netlink_ext_ack *extack);
+
+/*
+ * can_get_relative_tdco() - TDCO relative to the sample point
+ *
+ * struct can_tdc::tdco represents the absolute offset from TDCV. Some
+ * controllers use instead an offset relative to the Sample Point (SP)
+ * such that:
+ *
+ * SSP = TDCV + absolute TDCO
+ *     = TDCV + SP + relative TDCO
+ *
+ * -+----------- one bit ----------+-- TX pin
+ *  |<--- Sample Point --->|
+ *
+ *                         --+----------- one bit ----------+-- RX pin
+ *  |<-------- TDCV -------->|
+ *                           |<------------------------>| absolute TDCO
+ *                           |<--- Sample Point --->|
+ *                           |                      |<->| relative TDCO
+ *  |<------------- Secondary Sample Point ------------>|
+ */
+static inline s32 can_get_relative_tdco(const struct data_bittiming_params *dbt_params)
+{
+	const struct can_bittiming *dbt = &dbt_params->data_bittiming;
+	s32 sample_point_in_tc = (CAN_SYNC_SEG + dbt->prop_seg +
+				  dbt->phase_seg1) * dbt->brp;
+
+	return (s32)dbt_params->tdc.tdco - sample_point_in_tc;
+}
 
 /*
  * can_bit_time() - Duration of one bit

@@ -10,12 +10,11 @@
 #include <linux/blk-mq.h>
 #include <linux/skbuff.h>
 #include <linux/netdevice.h>
-#include <linux/genhd.h>
 #include <linux/moduleparam.h>
 #include <linux/workqueue.h>
 #include <linux/kthread.h>
 #include <net/net_namespace.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <linux/uio.h>
 #include "aoe.h"
 
@@ -122,7 +121,7 @@ newtag(struct aoedev *d)
 	register ulong n;
 
 	n = jiffies & 0xffff;
-	return n |= (++d->lasttag & 0x7fff) << 16;
+	return n | (++d->lasttag & 0x7fff) << 16;
 }
 
 static u32
@@ -746,7 +745,7 @@ rexmit_timer(struct timer_list *timer)
 	int utgts;	/* number of aoetgt descriptors (not slots) */
 	int since;
 
-	d = from_timer(d, timer, timer);
+	d = timer_container_of(d, timer, timer);
 
 	spin_lock_irqsave(&d->lock, flags);
 
@@ -755,7 +754,7 @@ rexmit_timer(struct timer_list *timer)
 
 	utgts = count_targets(d, NULL);
 
-	if (d->flags & DEVFL_TKILL) {
+	if (d->flags & (DEVFL_TKILL | DEVFL_DEAD)) {
 		spin_unlock_irqrestore(&d->lock, flags);
 		return;
 	}
@@ -787,7 +786,8 @@ rexmit_timer(struct timer_list *timer)
 			 * to clean up.
 			 */
 			list_splice(&flist, &d->factive[0]);
-			aoedev_downdev(d);
+			d->flags |= DEVFL_DEAD;
+			queue_work(aoe_wq, &d->work);
 			goto out;
 		}
 
@@ -899,6 +899,9 @@ aoecmd_sleepwork(struct work_struct *work)
 {
 	struct aoedev *d = container_of(work, struct aoedev, work);
 
+	if (d->flags & DEVFL_DEAD)
+		aoedev_downdev(d);
+
 	if (d->flags & DEVFL_GDALLOC)
 		aoeblk_gdalloc(d);
 
@@ -977,7 +980,7 @@ ataid_complete(struct aoedev *d, struct aoetgt *t, unsigned char *id)
 		d->flags |= DEVFL_NEWSIZE;
 	else
 		d->flags |= DEVFL_GDALLOC;
-	schedule_work(&d->work);
+	queue_work(aoe_wq, &d->work);
 }
 
 static void
@@ -1027,9 +1030,9 @@ bvcpy(struct sk_buff *skb, struct bio *bio, struct bvec_iter iter, long cnt)
 	iter.bi_size = cnt;
 
 	__bio_for_each_segment(bv, bio, iter, iter) {
-		char *p = kmap_atomic(bv.bv_page) + bv.bv_offset;
+		char *p = bvec_kmap_local(&bv);
 		skb_copy_bits(skb, soff, p, bv.bv_len);
-		kunmap_atomic(p);
+		kunmap_local(p);
 		soff += bv.bv_len;
 	}
 }
@@ -1758,6 +1761,6 @@ aoecmd_exit(void)
 	kfree(kts);
 	kfree(ktiowq);
 
-	free_page((unsigned long) page_address(empty_page));
+	__free_page(empty_page);
 	empty_page = NULL;
 }

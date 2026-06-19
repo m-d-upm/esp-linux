@@ -19,7 +19,7 @@
 #include <linux/smp.h>
 #include <linux/binfmts.h>	/* do_coredum */
 #include <linux/bitops.h>
-#include <linux/tracehook.h>
+#include <linux/resume_user_mode.h>
 
 #include <linux/uaccess.h>
 #include <asm/ptrace.h>
@@ -473,7 +473,7 @@ static void do_signal(struct pt_regs *regs, unsigned long orig_i0)
 	 *
 	 * %g7 is used as the "thread register".   %g6 is not used in
 	 * any fixed manner.  %g6 is used as a scratch register and
-	 * a compiler temporary, but it's value is never used across
+	 * a compiler temporary, but its value is never used across
 	 * a system call.  Therefore %g6 is usable for orig_i0 storage.
 	 */
 	if (pt_regs_is_syscall(regs) && (regs->psr & PSR_C))
@@ -524,7 +524,7 @@ void do_notify_resume(struct pt_regs *regs, unsigned long orig_i0,
 	if (thread_info_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
 		do_signal(regs, orig_i0);
 	if (thread_info_flags & _TIF_NOTIFY_RESUME)
-		tracehook_notify_resume(regs);
+		resume_user_mode_work(regs);
 }
 
 asmlinkage int do_sys_sigstack(struct sigstack __user *ssptr,

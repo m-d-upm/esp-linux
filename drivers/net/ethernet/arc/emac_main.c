@@ -15,11 +15,11 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/of_mdio.h>
 #include <linux/of_net.h>
-#include <linux/of_platform.h>
 
 #include "emac.h"
 
@@ -91,7 +91,7 @@ static void arc_emac_get_drvinfo(struct net_device *ndev,
 {
 	struct arc_emac_priv *priv = netdev_priv(ndev);
 
-	strlcpy(info->driver, priv->drv_name, sizeof(info->driver));
+	strscpy(info->driver, priv->drv_name, sizeof(info->driver));
 }
 
 static const struct ethtool_ops arc_emac_ethtool_ops = {
@@ -778,7 +778,7 @@ static int arc_emac_set_address(struct net_device *ndev, void *p)
 	if (!is_valid_ether_addr(addr->sa_data))
 		return -EADDRNOTAVAIL;
 
-	memcpy(ndev->dev_addr, addr->sa_data, ndev->addr_len);
+	eth_hw_addr_set(ndev, addr->sa_data);
 
 	arc_emac_set_address_internal(ndev);
 
@@ -934,6 +934,17 @@ int arc_emac_probe(struct net_device *ndev, int interface)
 	/* Set poll rate so that it polls every 1 ms */
 	arc_reg_set(priv, R_POLLRATE, clock_frequency / 1000000);
 
+	/*
+	 * Put the device into a known quiescent state before requesting
+	 * the IRQ. Clear only EMAC interrupt status bits here; leave the
+	 * MDIO completion bit alone and avoid writing TXPL_MASK, which is
+	 * used to force TX polling rather than acknowledge interrupts.
+	 */
+	arc_reg_set(priv, R_ENABLE, 0);
+	arc_reg_set(priv, R_STATUS, RXINT_MASK | TXINT_MASK | ERR_MASK |
+		    TXCH_MASK | MSER_MASK | RXCR_MASK |
+		    RXFR_MASK | RXFL_MASK);
+
 	ndev->irq = irq;
 	dev_info(dev, "IRQ is %d\n", ndev->irq);
 
@@ -986,7 +997,8 @@ int arc_emac_probe(struct net_device *ndev, int interface)
 	dev_info(dev, "connected to %s phy with id 0x%x\n",
 		 phydev->drv->name, phydev->phy_id);
 
-	netif_napi_add(ndev, &priv->napi, arc_emac_poll, ARC_EMAC_NAPI_WEIGHT);
+	netif_napi_add_weight(ndev, &priv->napi, arc_emac_poll,
+			      ARC_EMAC_NAPI_WEIGHT);
 
 	err = register_netdev(ndev);
 	if (err) {
@@ -1012,7 +1024,7 @@ out_put_node:
 }
 EXPORT_SYMBOL_GPL(arc_emac_probe);
 
-int arc_emac_remove(struct net_device *ndev)
+void arc_emac_remove(struct net_device *ndev)
 {
 	struct arc_emac_priv *priv = netdev_priv(ndev);
 
@@ -1023,8 +1035,6 @@ int arc_emac_remove(struct net_device *ndev)
 
 	if (!IS_ERR(priv->clk))
 		clk_disable_unprepare(priv->clk);
-
-	return 0;
 }
 EXPORT_SYMBOL_GPL(arc_emac_remove);
 

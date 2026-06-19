@@ -160,7 +160,8 @@ enum mhuv2_frame {
  * struct mhuv2 - MHUv2 mailbox controller data
  *
  * @mbox:	Mailbox controller belonging to the MHU frame.
- * @send/recv:	Base address of the register mapping region.
+ * @send:	Base address of the register mapping region.
+ * @recv:	Base address of the register mapping region.
  * @frame:	Frame type: RECEIVER_FRAME or SENDER_FRAME.
  * @irq:	Interrupt.
  * @windows:	Channel windows implemented by the platform.
@@ -1106,7 +1107,7 @@ static void mhuv2_remove(struct amba_device *adev)
 		writel_relaxed(0x0, &mhu->send->access_request);
 }
 
-static struct amba_id mhuv2_ids[] = {
+static const struct amba_id mhuv2_ids[] = {
 	{
 		/* 2.0 */
 		.id = 0xbb0d1,

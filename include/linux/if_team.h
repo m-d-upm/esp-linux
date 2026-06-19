@@ -12,11 +12,11 @@
 #include <uapi/linux/if_team.h>
 
 struct team_pcpu_stats {
-	u64			rx_packets;
-	u64			rx_bytes;
-	u64			rx_multicast;
-	u64			tx_packets;
-	u64			tx_bytes;
+	u64_stats_t		rx_packets;
+	u64_stats_t		rx_bytes;
+	u64_stats_t		rx_multicast;
+	u64_stats_t		tx_packets;
+	u64_stats_t		tx_bytes;
 	struct u64_stats_sync	syncp;
 	u32			rx_dropped;
 	u32			tx_dropped;
@@ -121,8 +121,7 @@ struct team_mode_ops {
 	int (*port_enter)(struct team *team, struct team_port *port);
 	void (*port_leave)(struct team *team, struct team_port *port);
 	void (*port_change_dev_addr)(struct team *team, struct team_port *port);
-	void (*port_enabled)(struct team *team, struct team_port *port);
-	void (*port_disabled)(struct team *team, struct team_port *port);
+	void (*port_tx_disabled)(struct team *team, struct team_port *port);
 };
 
 extern int team_modeop_port_enter(struct team *team, struct team_port *port);
@@ -162,8 +161,8 @@ struct team_option {
 	bool per_port;
 	unsigned int array_size; /* != 0 means the option is array */
 	enum team_option_type type;
-	int (*init)(struct team *team, struct team_option_inst_info *info);
-	int (*getter)(struct team *team, struct team_gsetter_ctx *ctx);
+	void (*init)(struct team *team, struct team_option_inst_info *info);
+	void (*getter)(struct team *team, struct team_gsetter_ctx *ctx);
 	int (*setter)(struct team *team, struct team_gsetter_ctx *ctx);
 };
 
@@ -190,8 +189,6 @@ struct team {
 	struct team_pcpu_stats __percpu *pcpu_stats;
 
 	const struct header_ops *header_ops_cache;
-
-	struct mutex lock; /* used for overall locking, e.g. port lists write */
 
 	/*
 	 * List of enabled ports and their count
@@ -223,7 +220,6 @@ struct team {
 		atomic_t count_pending;
 		struct delayed_work dw;
 	} mcast_rejoin;
-	struct lock_class_key team_lock_key;
 	long mode_priv[TEAM_MODE_PRIV_LONGS];
 };
 

@@ -149,7 +149,7 @@ dummy_timer(struct timer_list *t)
 {
 	struct aoedev *d;
 
-	d = from_timer(d, t, timer);
+	d = timer_container_of(d, t, timer);
 	if (d->flags & DEVFL_TKILL)
 		return;
 	d->timer.expires = jiffies + HZ;
@@ -200,8 +200,11 @@ aoedev_downdev(struct aoedev *d)
 	struct list_head *head, *pos, *nx;
 	struct request *rq, *rqnext;
 	int i;
+	unsigned long flags;
 
-	d->flags &= ~DEVFL_UP;
+	spin_lock_irqsave(&d->lock, flags);
+	d->flags &= ~(DEVFL_UP | DEVFL_DEAD);
+	spin_unlock_irqrestore(&d->lock, flags);
 
 	/* clean out active and to-be-retransmitted buffers */
 	for (i = 0; i < NFACTIVE; i++) {
@@ -234,10 +237,11 @@ aoedev_downdev(struct aoedev *d)
 	/* fast fail all pending I/O */
 	if (d->blkq) {
 		/* UP is cleared, freeze+quiesce to insure all are errored */
-		blk_mq_freeze_queue(d->blkq);
+		unsigned int memflags = blk_mq_freeze_queue(d->blkq);
+
 		blk_mq_quiesce_queue(d->blkq);
 		blk_mq_unquiesce_queue(d->blkq);
-		blk_mq_unfreeze_queue(d->blkq);
+		blk_mq_unfreeze_queue(d->blkq, memflags);
 	}
 
 	if (d->gd)
@@ -281,11 +285,11 @@ freedev(struct aoedev *d)
 	if (!freeing)
 		return;
 
-	del_timer_sync(&d->timer);
+	timer_delete_sync(&d->timer);
 	if (d->gd) {
 		aoedisk_rm_debugfs(d);
 		del_gendisk(d->gd);
-		blk_cleanup_disk(d->gd);
+		put_disk(d->gd);
 		blk_mq_free_tag_set(&d->tag_set);
 	}
 	t = d->targets;
@@ -329,7 +333,7 @@ flush(const char __user *str, size_t cnt, int exiting)
 			specified = 1;
 	}
 
-	flush_scheduled_work();
+	flush_workqueue(aoe_wq);
 	/* pass one: do aoedev_downdev, which might sleep */
 restart1:
 	spin_lock_irqsave(&devlist_lock, flags);
@@ -528,7 +532,7 @@ freetgt(struct aoedev *d, struct aoetgt *t)
 void
 aoedev_exit(void)
 {
-	flush_scheduled_work();
+	flush_workqueue(aoe_wq);
 	flush(NULL, 0, EXITING);
 }
 

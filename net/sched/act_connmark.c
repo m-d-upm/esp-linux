@@ -20,6 +20,7 @@
 #include <net/pkt_cls.h>
 #include <uapi/linux/tc_act/tc_connmark.h>
 #include <net/tc_act/tc_connmark.h>
+#include <net/tc_wrapper.h>
 
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_core.h>
@@ -27,8 +28,9 @@
 
 static struct tc_action_ops act_connmark_ops;
 
-static int tcf_connmark_act(struct sk_buff *skb, const struct tc_action *a,
-			    struct tcf_result *res)
+TC_INDIRECT_SCOPE int tcf_connmark_act(struct sk_buff *skb,
+				       const struct tc_action *a,
+				       struct tcf_result *res)
 {
 	const struct nf_conntrack_tuple_hash *thash;
 	struct nf_conntrack_tuple tuple;
@@ -144,7 +146,7 @@ static int tcf_connmark_init(struct net *net, struct nlattr *nla,
 	} else if (ret > 0) {
 		ci = to_connmark(*a);
 		if (bind) {
-			err = 0;
+			err = ACT_P_BOUND;
 			goto out_free;
 		}
 		if (!(flags & TCA_ACT_FLAGS_REPLACE)) {
@@ -244,6 +246,7 @@ static struct tc_action_ops act_connmark_ops = {
 	.cleanup	=	tcf_connmark_cleanup,
 	.size		=	sizeof(struct tcf_connmark_info),
 };
+MODULE_ALIAS_NET_ACT("connmark");
 
 static __net_init int connmark_init_net(struct net *net)
 {

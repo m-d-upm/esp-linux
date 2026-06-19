@@ -11,7 +11,7 @@
  * Copyright (c) 2020-2022 Vincent Mailhol <mailhol.vincent@wanadoo.fr>
  */
 
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <linux/kernel.h>
 #include <linux/units.h>
 
@@ -69,7 +69,8 @@ static int es58x_fd_echo_msg(struct net_device *netdev,
 	int i, num_element;
 	u32 rcv_packet_idx;
 
-	const u32 mask = GENMASK(31, sizeof(echo_msg->packet_idx) * 8);
+	const u32 mask = GENMASK(BITS_PER_TYPE(mask) - 1,
+				 BITS_PER_TYPE(echo_msg->packet_idx));
 
 	num_element = es58x_msg_num_element(es58x_dev->dev,
 					    es58x_fd_urb_cmd->echo_msg,
@@ -426,12 +427,12 @@ static int es58x_fd_enable_channel(struct es58x_priv *priv)
 
 	if (tx_conf_msg.canfd_enabled) {
 		es58x_fd_convert_bittiming(&tx_conf_msg.data_bittiming,
-					   &priv->can.data_bittiming);
+					   &priv->can.fd.data_bittiming);
 
-		if (can_tdc_is_enabled(&priv->can)) {
+		if (can_fd_tdc_is_enabled(&priv->can)) {
 			tx_conf_msg.tdc_enabled = 1;
-			tx_conf_msg.tdco = cpu_to_le16(priv->can.tdc.tdco);
-			tx_conf_msg.tdcf = cpu_to_le16(priv->can.tdc.tdcf);
+			tx_conf_msg.tdco = cpu_to_le16(priv->can.fd.tdc.tdco);
+			tx_conf_msg.tdcf = cpu_to_le16(priv->can.fd.tdc.tdcf);
 		}
 
 		conf_len = ES58X_FD_CANFD_CONF_LEN;

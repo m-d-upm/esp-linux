@@ -134,7 +134,8 @@ int qedr_query_device(struct ib_device *ibdev,
 	attr->max_qp_wr = max_t(u32, qattr->max_sqe, qattr->max_rqe);
 	attr->device_cap_flags = IB_DEVICE_CURR_QP_STATE_MOD |
 	    IB_DEVICE_RC_RNR_NAK_GEN |
-	    IB_DEVICE_LOCAL_DMA_LKEY | IB_DEVICE_MEM_MGT_EXTENSIONS;
+	    IB_DEVICE_MEM_MGT_EXTENSIONS;
+	attr->kernel_cap_flags = IBK_LOCAL_DMA_LKEY;
 
 	if (!rdma_protocol_iwarp(&dev->ibdev, 1))
 		attr->device_cap_flags |= IB_DEVICE_XRC;
@@ -899,8 +900,9 @@ int qedr_arm_cq(struct ib_cq *ibcq, enum ib_cq_notify_flags flags)
 }
 
 int qedr_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
-		   struct ib_udata *udata)
+		   struct uverbs_attr_bundle *attrs)
 {
+	struct ib_udata *udata = &attrs->driver_udata;
 	struct ib_device *ibdev = ibcq->device;
 	struct qedr_ucontext *ctx = rdma_udata_to_drv_context(
 		udata, struct qedr_ucontext, ibucontext);
@@ -1050,16 +1052,6 @@ err1:
 	}
 err0:
 	return -EINVAL;
-}
-
-int qedr_resize_cq(struct ib_cq *ibcq, int new_cnt, struct ib_udata *udata)
-{
-	struct qedr_dev *dev = get_qedr_dev(ibcq->device);
-	struct qedr_cq *cq = get_qedr_cq(ibcq);
-
-	DP_ERR(dev, "cq %p RESIZE NOT SUPPORTED\n", cq);
-
-	return 0;
 }
 
 #define QEDR_DESTROY_CQ_MAX_ITERATIONS		(10)
@@ -1367,7 +1359,7 @@ static void qedr_set_common_qp_params(struct qedr_dev *dev,
 
 	qp->prev_wqe_size = 0;
 
-	qp->signaled = (attrs->sq_sig_type == IB_SIGNAL_ALL_WR) ? true : false;
+	qp->signaled = attrs->sq_sig_type == IB_SIGNAL_ALL_WR;
 	qp->dev = dev;
 	if (qedr_qp_has_sq(qp)) {
 		qedr_reset_qp_hwq_info(&qp->sq);
@@ -2961,12 +2953,16 @@ done:
 }
 
 struct ib_mr *qedr_reg_user_mr(struct ib_pd *ibpd, u64 start, u64 len,
-			       u64 usr_addr, int acc, struct ib_udata *udata)
+			       u64 usr_addr, int acc, struct ib_dmah *dmah,
+			       struct ib_udata *udata)
 {
 	struct qedr_dev *dev = get_qedr_dev(ibpd->device);
 	struct qedr_mr *mr;
 	struct qedr_pd *pd;
 	int rc = -ENOMEM;
+
+	if (dmah)
+		return ERR_PTR(-EOPNOTSUPP);
 
 	pd = get_qedr_pd(ibpd);
 	DP_DEBUG(dev, QEDR_MSG_MR,

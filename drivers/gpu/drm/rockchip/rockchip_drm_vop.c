@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (C) Fuzhou Rockchip Electronics Co.Ltd
+ * Copyright (C) Rockchip Electronics Co., Ltd.
  * Author:Mark Yao <mark.yao@rock-chips.com>
  */
 
@@ -12,7 +12,6 @@
 #include <linux/log2.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -21,12 +20,13 @@
 #include <drm/drm.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_uapi.h>
+#include <drm/drm_blend.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_flip_work.h>
 #include <drm/drm_fourcc.h>
+#include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
-#include <drm/drm_plane_helper.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_self_refresh_helper.h>
 #include <drm/drm_vblank.h>
@@ -187,12 +187,6 @@ struct vop {
 	struct vop_win win[];
 };
 
-static inline void vop_writel(struct vop *vop, uint32_t offset, uint32_t v)
-{
-	writel(v, vop->regs + offset);
-	vop->regsbak[offset >> 2] = v;
-}
-
 static inline uint32_t vop_readl(struct vop *vop, uint32_t offset)
 {
 	return readl(vop->regs + offset);
@@ -274,6 +268,30 @@ static bool has_rb_swapped(uint32_t version, uint32_t format)
 	}
 }
 
+static bool has_uv_swapped(uint32_t format)
+{
+	switch (format) {
+	case DRM_FORMAT_NV21:
+	case DRM_FORMAT_NV61:
+	case DRM_FORMAT_NV42:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool is_fmt_10(uint32_t format)
+{
+	switch (format) {
+	case DRM_FORMAT_NV15:
+	case DRM_FORMAT_NV20:
+	case DRM_FORMAT_NV30:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static enum vop_data_format vop_convert_format(uint32_t format)
 {
 	switch (format) {
@@ -289,10 +307,16 @@ static enum vop_data_format vop_convert_format(uint32_t format)
 	case DRM_FORMAT_BGR565:
 		return VOP_FMT_RGB565;
 	case DRM_FORMAT_NV12:
+	case DRM_FORMAT_NV15:
+	case DRM_FORMAT_NV21:
 		return VOP_FMT_YUV420SP;
 	case DRM_FORMAT_NV16:
+	case DRM_FORMAT_NV20:
+	case DRM_FORMAT_NV61:
 		return VOP_FMT_YUV422SP;
 	case DRM_FORMAT_NV24:
+	case DRM_FORMAT_NV30:
+	case DRM_FORMAT_NV42:
 		return VOP_FMT_YUV444SP;
 	default:
 		DRM_ERROR("unsupported format[%08x]\n", format);
@@ -314,13 +338,10 @@ static int vop_convert_afbc_format(uint32_t format)
 	case DRM_FORMAT_RGB565:
 	case DRM_FORMAT_BGR565:
 		return AFBC_FMT_RGB565;
-	/* either of the below should not be reachable */
 	default:
-		DRM_WARN_ONCE("unsupported AFBC format[%08x]\n", format);
+		DRM_DEBUG_KMS("unsupported AFBC format[%08x]\n", format);
 		return -EINVAL;
 	}
-
-	return -EINVAL;
 }
 
 static uint16_t scl_vop_cal_scale(enum scale_mode mode, uint32_t src,
@@ -600,7 +621,7 @@ static int vop_enable(struct drm_crtc *crtc, struct drm_crtc_state *old_state)
 	struct vop *vop = to_vop(crtc);
 	int ret, i;
 
-	ret = pm_runtime_get_sync(vop->dev);
+	ret = pm_runtime_resume_and_get(vop->dev);
 	if (ret < 0) {
 		DRM_DEV_ERROR(vop->dev, "failed to get pm runtime: %d\n", ret);
 		return ret;
@@ -712,11 +733,10 @@ static void vop_crtc_atomic_disable(struct drm_crtc *crtc,
 
 	WARN_ON(vop->event);
 
-	if (crtc->state->self_refresh_active)
+	if (crtc->state->self_refresh_active) {
 		rockchip_drm_set_win_enabled(crtc, false);
-
-	if (crtc->state->self_refresh_active)
 		goto out;
+	}
 
 	mutex_lock(&vop->vop_lock);
 
@@ -738,7 +758,9 @@ static void vop_crtc_atomic_disable(struct drm_crtc *crtc,
 
 	spin_unlock(&vop->reg_lock);
 
-	wait_for_completion(&vop->dsp_hold_completion);
+	if (!wait_for_completion_timeout(&vop->dsp_hold_completion,
+					 msecs_to_jiffies(200)))
+		WARN(1, "%s: timed out waiting for DSP hold", crtc->name);
 
 	vop_dsp_hold_valid_irq_disable(vop);
 
@@ -763,11 +785,6 @@ out:
 
 		crtc->state->event = NULL;
 	}
-}
-
-static void vop_plane_destroy(struct drm_plane *plane)
-{
-	drm_plane_cleanup(plane);
 }
 
 static inline bool rockchip_afbc(u64 modifier)
@@ -802,9 +819,9 @@ static int vop_plane_atomic_check(struct drm_plane *plane,
 	const struct vop_win_data *win = vop_win->data;
 	int ret;
 	int min_scale = win->phy->scl ? FRAC_16_16(1, 8) :
-					DRM_PLANE_HELPER_NO_SCALING;
+					DRM_PLANE_NO_SCALING;
 	int max_scale = win->phy->scl ? FRAC_16_16(8, 1) :
-					DRM_PLANE_HELPER_NO_SCALING;
+					DRM_PLANE_NO_SCALING;
 
 	if (!crtc || WARN_ON(!fb))
 		return 0;
@@ -910,7 +927,7 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
 	unsigned long offset;
 	dma_addr_t dma_addr;
 	uint32_t val;
-	bool rb_swap;
+	bool rb_swap, uv_swap;
 	int win_index = VOP_WIN_TO_INDEX(vop_win);
 	int format;
 	int is_yuv = fb->format->is_yuv;
@@ -944,7 +961,12 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
 	dsp_sty = dest->y1 + crtc->mode.vtotal - crtc->mode.vsync_start;
 	dsp_st = dsp_sty << 16 | (dsp_stx & 0xffff);
 
-	offset = (src->x1 >> 16) * fb->format->cpp[0];
+	if (fb->format->char_per_block[0])
+		offset = drm_format_info_min_pitch(fb->format, 0,
+						   src->x1 >> 16);
+	else
+		offset = (src->x1 >> 16) * fb->format->cpp[0];
+
 	offset += (src->y1 >> 16) * fb->pitches[0];
 	dma_addr = rk_obj->dma_addr + offset + fb->offsets[0];
 
@@ -970,6 +992,7 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
 	}
 
 	VOP_WIN_SET(vop, win, format, format);
+	VOP_WIN_SET(vop, win, fmt_10, is_fmt_10(fb->format->format));
 	VOP_WIN_SET(vop, win, yrgb_vir, DIV_ROUND_UP(fb->pitches[0], 4));
 	VOP_WIN_SET(vop, win, yrgb_mst, dma_addr);
 	VOP_WIN_YUV2YUV_SET(vop, win_yuv2yuv, y2r_en, is_yuv);
@@ -979,15 +1002,16 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
 		    (new_state->rotation & DRM_MODE_REFLECT_X) ? 1 : 0);
 
 	if (is_yuv) {
-		int hsub = fb->format->hsub;
-		int vsub = fb->format->vsub;
-		int bpp = fb->format->cpp[1];
-
 		uv_obj = fb->obj[1];
 		rk_uv_obj = to_rockchip_obj(uv_obj);
 
-		offset = (src->x1 >> 16) * bpp / hsub;
-		offset += (src->y1 >> 16) * fb->pitches[1] / vsub;
+		if (fb->format->char_per_block[1])
+			offset = drm_format_info_min_pitch(fb->format, 1,
+							   src->x1 >> 16);
+		else
+			offset = (src->x1 >> 16) * fb->format->cpp[1];
+		offset /= fb->format->hsub;
+		offset += (src->y1 >> 16) * fb->pitches[1] / fb->format->vsub;
 
 		dma_addr = rk_uv_obj->dma_addr + offset + fb->offsets[1];
 		VOP_WIN_SET(vop, win, uv_vir, DIV_ROUND_UP(fb->pitches[1], 4));
@@ -999,6 +1023,9 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
 							y2r_coefficients[i],
 							bt601_yuv2rgb[i]);
 		}
+
+		uv_swap = has_uv_swapped(fb->format->format);
+		VOP_WIN_SET(vop, win, uv_swap, uv_swap);
 	}
 
 	if (win->phy->scl)
@@ -1044,16 +1071,16 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
 }
 
 static int vop_plane_atomic_async_check(struct drm_plane *plane,
-					struct drm_atomic_state *state)
+					struct drm_atomic_state *state, bool flip)
 {
 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state,
 										 plane);
 	struct vop_win *vop_win = to_vop_win(plane);
 	const struct vop_win_data *win = vop_win->data;
 	int min_scale = win->phy->scl ? FRAC_16_16(1, 8) :
-					DRM_PLANE_HELPER_NO_SCALING;
+					DRM_PLANE_NO_SCALING;
 	int max_scale = win->phy->scl ? FRAC_16_16(8, 1) :
-					DRM_PLANE_HELPER_NO_SCALING;
+					DRM_PLANE_NO_SCALING;
 	struct drm_crtc_state *crtc_state;
 
 	if (plane != new_plane_state->crtc->cursor)
@@ -1128,7 +1155,7 @@ static const struct drm_plane_helper_funcs plane_helper_funcs = {
 static const struct drm_plane_funcs vop_plane_funcs = {
 	.update_plane	= drm_atomic_helper_update_plane,
 	.disable_plane	= drm_atomic_helper_disable_plane,
-	.destroy = vop_plane_destroy,
+	.destroy = drm_plane_cleanup,
 	.reset = drm_atomic_helper_plane_reset,
 	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
@@ -1168,6 +1195,17 @@ static void vop_crtc_disable_vblank(struct drm_crtc *crtc)
 	spin_unlock_irqrestore(&vop->irq_lock, flags);
 }
 
+static enum drm_mode_status vop_crtc_mode_valid(struct drm_crtc *crtc,
+						const struct drm_display_mode *mode)
+{
+	struct vop *vop = to_vop(crtc);
+
+	if (vop->data->max_output.width && mode->hdisplay > vop->data->max_output.width)
+		return MODE_BAD_HVALUE;
+
+	return MODE_OK;
+}
+
 static bool vop_crtc_mode_fixup(struct drm_crtc *crtc,
 				const struct drm_display_mode *mode,
 				struct drm_display_mode *adjusted_mode)
@@ -1180,7 +1218,7 @@ static bool vop_crtc_mode_fixup(struct drm_crtc *crtc,
 	 *
 	 * Key points:
 	 *
-	 * - DRM works in in kHz.
+	 * - DRM works in kHz.
 	 * - Clock framework works in Hz.
 	 * - Rockchip's clock driver picks the clock rate that is the
 	 *   same _OR LOWER_ than the one requested.
@@ -1583,6 +1621,7 @@ static void vop_crtc_atomic_flush(struct drm_crtc *crtc,
 }
 
 static const struct drm_crtc_helper_funcs vop_crtc_helper_funcs = {
+	.mode_valid = vop_crtc_mode_valid,
 	.mode_fixup = vop_crtc_mode_fixup,
 	.atomic_check = vop_crtc_atomic_check,
 	.atomic_begin = vop_crtc_atomic_begin,
@@ -1590,11 +1629,6 @@ static const struct drm_crtc_helper_funcs vop_crtc_helper_funcs = {
 	.atomic_enable = vop_crtc_atomic_enable,
 	.atomic_disable = vop_crtc_atomic_disable,
 };
-
-static void vop_crtc_destroy(struct drm_crtc *crtc)
-{
-	drm_crtc_cleanup(crtc);
-}
 
 static struct drm_crtc_state *vop_crtc_duplicate_state(struct drm_crtc *crtc)
 {
@@ -1703,7 +1737,7 @@ vop_crtc_verify_crc_source(struct drm_crtc *crtc, const char *source_name,
 static const struct drm_crtc_funcs vop_crtc_funcs = {
 	.set_config = drm_atomic_helper_set_config,
 	.page_flip = drm_atomic_helper_page_flip,
-	.destroy = vop_crtc_destroy,
+	.destroy = drm_crtc_cleanup,
 	.reset = vop_crtc_reset,
 	.atomic_duplicate_state = vop_crtc_duplicate_state,
 	.atomic_destroy_state = vop_crtc_destroy_state,
@@ -1954,7 +1988,7 @@ static void vop_destroy_crtc(struct vop *vop)
 	 */
 	list_for_each_entry_safe(plane, tmp, &drm_dev->mode_config.plane_list,
 				 head)
-		vop_plane_destroy(plane);
+		drm_plane_cleanup(plane);
 
 	/*
 	 * Destroy CRTC after vop_plane_destroy() since vop_disable_plane()
@@ -1985,7 +2019,7 @@ static int vop_initial(struct vop *vop)
 		return PTR_ERR(vop->dclk);
 	}
 
-	ret = pm_runtime_get_sync(vop->dev);
+	ret = pm_runtime_resume_and_get(vop->dev);
 	if (ret < 0) {
 		DRM_DEV_ERROR(vop->dev, "failed to get pm runtime: %d\n", ret);
 		return ret;
@@ -2223,12 +2257,14 @@ static int vop_bind(struct device *dev, struct device *master, void *data)
 		goto err_disable_pm_runtime;
 
 	if (vop->data->feature & VOP_FEATURE_INTERNAL_RGB) {
-		vop->rgb = rockchip_rgb_init(dev, &vop->crtc, vop->drm_dev);
+		vop->rgb = rockchip_rgb_init(dev, &vop->crtc, vop->drm_dev, 0);
 		if (IS_ERR(vop->rgb)) {
 			ret = PTR_ERR(vop->rgb);
 			goto err_disable_pm_runtime;
 		}
 	}
+
+	rockchip_drm_dma_init_device(drm_dev, dev);
 
 	return 0;
 

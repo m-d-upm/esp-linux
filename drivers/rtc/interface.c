@@ -205,7 +205,7 @@ static int rtc_read_alarm_internal(struct rtc_device *rtc,
 
 	mutex_unlock(&rtc->ops_lock);
 
-	trace_rtc_read_alarm(rtc_tm_to_time64(&alarm->time), err);
+	trace_rtc_read_alarm(err?0:rtc_tm_to_time64(&alarm->time), err);
 	return err;
 }
 
@@ -256,7 +256,7 @@ int __rtc_read_alarm(struct rtc_device *rtc, struct rtc_wkalrm *alarm)
 	 *
 	 * This could all instead be done in the lower level driver,
 	 * but since more than one lower level RTC implementation needs it,
-	 * then it's probably best best to do it here instead of there..
+	 * then it's probably best to do it here instead of there..
 	 */
 
 	/* Get the "before" timestamp */
@@ -375,7 +375,7 @@ int __rtc_read_alarm(struct rtc_device *rtc, struct rtc_wkalrm *alarm)
 	err = rtc_valid_tm(&alarm->time);
 
 done:
-	if (err)
+	if (err && alarm->enabled)
 		dev_warn(&rtc->dev, "invalid alarm value: %ptR\n",
 			 &alarm->time);
 	else
@@ -424,6 +424,7 @@ static int __rtc_set_alarm(struct rtc_device *rtc, struct rtc_wkalrm *alarm)
 	if (err)
 		return err;
 	now = rtc_tm_to_time64(&tm);
+
 	if (scheduled <= now)
 		return -ETIME;
 	/*
@@ -456,7 +457,7 @@ static int __rtc_set_alarm(struct rtc_device *rtc, struct rtc_wkalrm *alarm)
 	 * are in, we can return -ETIME to signal that the timer has already
 	 * expired, which is true in both cases.
 	 */
-	if ((scheduled - now) <= 1) {
+	if (!err && (scheduled - now) <= 1) {
 		err = __rtc_read_time(rtc, &tm);
 		if (err)
 			return err;
@@ -471,6 +472,7 @@ static int __rtc_set_alarm(struct rtc_device *rtc, struct rtc_wkalrm *alarm)
 
 int rtc_set_alarm(struct rtc_device *rtc, struct rtc_wkalrm *alarm)
 {
+	ktime_t alarm_time;
 	int err;
 
 	if (!rtc->ops)
@@ -492,7 +494,15 @@ int rtc_set_alarm(struct rtc_device *rtc, struct rtc_wkalrm *alarm)
 	if (rtc->aie_timer.enabled)
 		rtc_timer_remove(rtc, &rtc->aie_timer);
 
-	rtc->aie_timer.node.expires = rtc_tm_to_ktime(alarm->time);
+	alarm_time = rtc_tm_to_ktime(alarm->time);
+	/*
+	 * Round down so we never miss a deadline, checking for past deadline is
+	 * done in __rtc_set_alarm
+	 */
+	if (test_bit(RTC_FEATURE_ALARM_RES_MINUTE, rtc->features))
+		alarm_time = ktime_sub_ns(alarm_time, (u64)alarm->time.tm_sec * NSEC_PER_SEC);
+
+	rtc->aie_timer.node.expires = alarm_time;
 	rtc->aie_timer.period = 0;
 	if (alarm->enabled)
 		err = rtc_timer_enqueue(rtc, &rtc->aie_timer);
@@ -585,7 +595,8 @@ int rtc_update_irq_enable(struct rtc_device *rtc, unsigned int enabled)
 	if (rtc->uie_rtctimer.enabled == enabled)
 		goto out;
 
-	if (rtc->uie_unsupported || !test_bit(RTC_FEATURE_ALARM, rtc->features)) {
+	if (!test_bit(RTC_FEATURE_UPDATE_INTERRUPT, rtc->features) ||
+	    !test_bit(RTC_FEATURE_ALARM, rtc->features)) {
 		mutex_unlock(&rtc->ops_lock);
 #ifdef CONFIG_RTC_INTF_DEV_UIE_EMUL
 		return rtc_dev_update_irq_enable_emul(rtc, enabled);
@@ -713,7 +724,7 @@ struct rtc_device *rtc_class_open(const char *name)
 	struct device *dev;
 	struct rtc_device *rtc = NULL;
 
-	dev = class_find_device_by_name(rtc_class, name);
+	dev = class_find_device_by_name(&rtc_class, name);
 	if (dev)
 		rtc = to_rtc_device(dev);
 

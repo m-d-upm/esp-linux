@@ -317,7 +317,7 @@ static void p54_pspoll_workaround(struct p54_common *priv, struct sk_buff *skb)
 	tim_len = tim[1];
 	tim_ie = (struct ieee80211_tim_ie *) &tim[2];
 
-	new_psm = ieee80211_check_tim(tim_ie, tim_len, priv->aid);
+	new_psm = ieee80211_check_tim(tim_ie, tim_len, priv->aid, false);
 	if (new_psm != priv->powersave_override) {
 		priv->powersave_override = new_psm;
 		p54_set_ps(priv);
@@ -431,11 +431,7 @@ static void p54_rx_frame_sent(struct p54_common *priv, struct sk_buff *skb)
 	 * Clear manually, ieee80211_tx_info_clear_status would
 	 * clear the counts too and we need them.
 	 */
-	memset(&info->status.ack_signal, 0,
-	       sizeof(struct ieee80211_tx_info) -
-	       offsetof(struct ieee80211_tx_info, status.ack_signal));
-	BUILD_BUG_ON(offsetof(struct ieee80211_tx_info,
-			      status.ack_signal) != 20);
+	memset_after(&info->status, 0, rates);
 
 	if (entry_hdr->flags & cpu_to_le16(P54_HDR_FLAG_DATA_ALIGN))
 		pad = entry_data->align[0];

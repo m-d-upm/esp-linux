@@ -452,7 +452,7 @@ static irqreturn_t omap_dsi_irq_handler(int irq, void *arg)
 
 #ifdef DSI_CATCH_MISSING_TE
 	if (irqstatus & DSI_IRQ_TE_TRIGGER)
-		del_timer(&dsi->te_timer);
+		timer_delete(&dsi->te_timer);
 #endif
 
 	/* make a copy and unlock, so that isrs can unregister
@@ -2100,7 +2100,7 @@ static int dsi_vc_send_long(struct dsi_data *dsi, int vc,
 	u8 b1, b2, b3, b4;
 
 	if (dsi->debug_write)
-		DSSDBG("dsi_vc_send_long, %d bytes\n", msg->tx_len);
+		DSSDBG("dsi_vc_send_long, %zu bytes\n", msg->tx_len);
 
 	/* len + header */
 	if (dsi->vc[vc].tx_fifo_size * 32 * 4 < msg->tx_len + 4) {
@@ -2396,7 +2396,7 @@ static int dsi_vc_generic_read(struct omap_dss_device *dssdev, int vc,
 
 	return 0;
 err:
-	DSSERR("%s(vc %d, reqlen %d) failed\n", __func__,  vc, msg->tx_len);
+	DSSERR("%s(vc %d, reqlen %zu) failed\n", __func__,  vc, msg->tx_len);
 	return r;
 }
 
@@ -4617,6 +4617,7 @@ static const struct component_ops dsi_component_ops = {
  */
 
 static int dsi_bridge_attach(struct drm_bridge *bridge,
+			     struct drm_encoder *encoder,
 			     enum drm_bridge_attach_flags flags)
 {
 	struct dsi_data *dsi = drm_bridge_to_dsi(bridge);
@@ -4624,7 +4625,7 @@ static int dsi_bridge_attach(struct drm_bridge *bridge,
 	if (!(flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR))
 		return -EINVAL;
 
-	return drm_bridge_attach(bridge->encoder, dsi->output.next_bridge,
+	return drm_bridge_attach(encoder, dsi->output.next_bridge,
 				 bridge, flags);
 }
 
@@ -4700,7 +4701,6 @@ static const struct drm_bridge_funcs dsi_bridge_funcs = {
 
 static void dsi_bridge_init(struct dsi_data *dsi)
 {
-	dsi->bridge.funcs = &dsi_bridge_funcs;
 	dsi->bridge.of_node = dsi->host.dev->of_node;
 	dsi->bridge.type = DRM_MODE_CONNECTOR_DSI;
 
@@ -4890,13 +4890,12 @@ static int dsi_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct dsi_data *dsi;
 	struct resource *dsi_mem;
-	struct resource *res;
 	unsigned int i;
 	int r;
 
-	dsi = devm_kzalloc(dev, sizeof(*dsi), GFP_KERNEL);
-	if (!dsi)
-		return -ENOMEM;
+	dsi = devm_drm_bridge_alloc(dev, struct dsi_data, bridge, &dsi_bridge_funcs);
+	if (IS_ERR(dsi))
+		return PTR_ERR(dsi);
 
 	dsi->dev = dev;
 	dev_set_drvdata(dev, dsi);
@@ -4927,13 +4926,11 @@ static int dsi_probe(struct platform_device *pdev)
 	if (IS_ERR(dsi->proto_base))
 		return PTR_ERR(dsi->proto_base);
 
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "phy");
-	dsi->phy_base = devm_ioremap_resource(dev, res);
+	dsi->phy_base = devm_platform_ioremap_resource_byname(pdev, "phy");
 	if (IS_ERR(dsi->phy_base))
 		return PTR_ERR(dsi->phy_base);
 
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pll");
-	dsi->pll_base = devm_ioremap_resource(dev, res);
+	dsi->pll_base = devm_platform_ioremap_resource_byname(pdev, "pll");
 	if (IS_ERR(dsi->pll_base))
 		return PTR_ERR(dsi->pll_base);
 
@@ -5047,7 +5044,7 @@ err_pm_disable:
 	return r;
 }
 
-static int dsi_remove(struct platform_device *pdev)
+static void dsi_remove(struct platform_device *pdev)
 {
 	struct dsi_data *dsi = platform_get_drvdata(pdev);
 
@@ -5063,11 +5060,9 @@ static int dsi_remove(struct platform_device *pdev)
 		regulator_disable(dsi->vdds_dsi_reg);
 		dsi->vdds_dsi_enabled = false;
 	}
-
-	return 0;
 }
 
-static int dsi_runtime_suspend(struct device *dev)
+static __maybe_unused int dsi_runtime_suspend(struct device *dev)
 {
 	struct dsi_data *dsi = dev_get_drvdata(dev);
 
@@ -5080,7 +5075,7 @@ static int dsi_runtime_suspend(struct device *dev)
 	return 0;
 }
 
-static int dsi_runtime_resume(struct device *dev)
+static __maybe_unused int dsi_runtime_resume(struct device *dev)
 {
 	struct dsi_data *dsi = dev_get_drvdata(dev);
 
@@ -5092,8 +5087,7 @@ static int dsi_runtime_resume(struct device *dev)
 }
 
 static const struct dev_pm_ops dsi_pm_ops = {
-	.runtime_suspend = dsi_runtime_suspend,
-	.runtime_resume = dsi_runtime_resume,
+	SET_RUNTIME_PM_OPS(dsi_runtime_suspend, dsi_runtime_resume, NULL)
 	SET_LATE_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
 };
 

@@ -207,16 +207,6 @@ static inline void atl1c_irq_disable(struct atl1c_adapter *adapter)
 	synchronize_irq(adapter->pdev->irq);
 }
 
-/**
- * atl1c_irq_reset - reset interrupt confiure on the NIC
- * @adapter: board private structure
- */
-static inline void atl1c_irq_reset(struct atl1c_adapter *adapter)
-{
-	atomic_set(&adapter->irq_sem, 1);
-	atl1c_irq_enable(adapter);
-}
-
 /*
  * atl1c_wait_until_idle - wait up to AT_HW_MAX_IDLE_DELAY reads
  * of the idle status register until the device is actually idle
@@ -241,8 +231,8 @@ static u32 atl1c_wait_until_idle(struct atl1c_hw *hw, u32 modu_ctrl)
  */
 static void atl1c_phy_config(struct timer_list *t)
 {
-	struct atl1c_adapter *adapter = from_timer(adapter, t,
-						   phy_config_timer);
+	struct atl1c_adapter *adapter = timer_container_of(adapter, t,
+							   phy_config_timer);
 	struct atl1c_hw *hw = &adapter->hw;
 	unsigned long flags;
 
@@ -367,7 +357,7 @@ static void atl1c_common_task(struct work_struct *work)
 
 static void atl1c_del_timer(struct atl1c_adapter *adapter)
 {
-	del_timer_sync(&adapter->phy_config_timer);
+	timer_delete_sync(&adapter->phy_config_timer);
 }
 
 
@@ -482,7 +472,7 @@ static int atl1c_set_mac_addr(struct net_device *netdev, void *p)
 	if (netif_running(netdev))
 		return -EBUSY;
 
-	memcpy(netdev->dev_addr, addr->sa_data, netdev->addr_len);
+	eth_hw_addr_set(netdev, addr->sa_data);
 	memcpy(adapter->hw.mac_addr, addr->sa_data, netdev->addr_len);
 
 	atl1c_hw_set_mac_addr(&adapter->hw, adapter->hw.mac_addr);
@@ -571,7 +561,7 @@ static int atl1c_change_mtu(struct net_device *netdev, int new_mtu)
 	if (netif_running(netdev)) {
 		while (test_and_set_bit(__AT_RESETTING, &adapter->flags))
 			msleep(1);
-		netdev->mtu = new_mtu;
+		WRITE_ONCE(netdev->mtu, new_mtu);
 		adapter->hw.max_frame_size = new_mtu;
 		atl1c_set_rxbufsize(adapter, netdev);
 		atl1c_down(adapter);
@@ -852,7 +842,8 @@ static int atl1c_sw_init(struct atl1c_adapter *adapter)
 }
 
 static inline void atl1c_clean_buffer(struct pci_dev *pdev,
-				struct atl1c_buffer *buffer_info)
+				      struct atl1c_buffer *buffer_info,
+				      int budget)
 {
 	u16 pci_driection;
 	if (buffer_info->flags & ATL1C_BUFFER_FREE)
@@ -871,7 +862,7 @@ static inline void atl1c_clean_buffer(struct pci_dev *pdev,
 				       buffer_info->length, pci_driection);
 	}
 	if (buffer_info->skb)
-		dev_consume_skb_any(buffer_info->skb);
+		napi_consume_skb(buffer_info->skb, budget);
 	buffer_info->dma = 0;
 	buffer_info->skb = NULL;
 	ATL1C_SET_BUFFER_STATE(buffer_info, ATL1C_BUFFER_FREE);
@@ -892,7 +883,7 @@ static void atl1c_clean_tx_ring(struct atl1c_adapter *adapter,
 	ring_count = tpd_ring->count;
 	for (index = 0; index < ring_count; index++) {
 		buffer_info = &tpd_ring->buffer_info[index];
-		atl1c_clean_buffer(pdev, buffer_info);
+		atl1c_clean_buffer(pdev, buffer_info, 0);
 	}
 
 	netdev_tx_reset_queue(netdev_get_tx_queue(adapter->netdev, queue));
@@ -919,7 +910,7 @@ static void atl1c_clean_rx_ring(struct atl1c_adapter *adapter, u32 queue)
 
 	for (j = 0; j < rfd_ring->count; j++) {
 		buffer_info = &rfd_ring->buffer_info[j];
-		atl1c_clean_buffer(pdev, buffer_info);
+		atl1c_clean_buffer(pdev, buffer_info, 0);
 	}
 	/* zero out the descriptor ring */
 	memset(rfd_ring->desc, 0, rfd_ring->size);
@@ -1039,7 +1030,7 @@ static int atl1c_setup_ring_resources(struct atl1c_adapter *adapter)
 	 * each ring/block may need up to 8 bytes for alignment, hence the
 	 * additional bytes tacked onto the end.
 	 */
-	ring_header->size = size =
+	ring_header->size =
 		sizeof(struct atl1c_tpd_desc) * tpd_ring->count * tqc +
 		sizeof(struct atl1c_rx_free_desc) * rfd_ring->count * rqc +
 		sizeof(struct atl1c_recv_ret_status) * rfd_ring->count * rqc +
@@ -1617,7 +1608,7 @@ static int atl1c_clean_tx(struct napi_struct *napi, int budget)
 			total_bytes += buffer_info->skb->len;
 			total_packets++;
 		}
-		atl1c_clean_buffer(pdev, buffer_info);
+		atl1c_clean_buffer(pdev, buffer_info, budget);
 		if (++next_to_clean == tpd_ring->count)
 			next_to_clean = 0;
 		atomic_set(&tpd_ring->next_to_clean, next_to_clean);
@@ -1812,7 +1803,7 @@ static int atl1c_alloc_rx_buffer(struct atl1c_adapter *adapter, u32 queue,
 			buffer_info->skb = NULL;
 			buffer_info->length = 0;
 			ATL1C_SET_BUFFER_STATE(buffer_info, ATL1C_BUFFER_FREE);
-			netif_warn(adapter, rx_err, adapter->netdev, "RX pci_map_single failed");
+			netif_warn(adapter, rx_err, adapter->netdev, "RX dma_map_single failed");
 			break;
 		}
 		buffer_info->dma = mapping;
@@ -2037,7 +2028,7 @@ static u16 atl1c_cal_tpd_req(const struct sk_buff *skb)
 	tpd_req = skb_shinfo(skb)->nr_frags + 1;
 
 	if (skb_is_gso(skb)) {
-		proto_hdr_len = skb_transport_offset(skb) + tcp_hdrlen(skb);
+		proto_hdr_len = skb_tcp_all_headers(skb);
 		if (proto_hdr_len < skb_headlen(skb))
 			tpd_req++;
 		if (skb_shinfo(skb)->gso_type & SKB_GSO_TCPV6)
@@ -2075,7 +2066,7 @@ static int atl1c_tso_csum(struct atl1c_adapter *adapter,
 					return err;
 			}
 
-			hdr_len = (skb_transport_offset(skb) + tcp_hdrlen(skb));
+			hdr_len = skb_tcp_all_headers(skb);
 			if (unlikely(skb->len == hdr_len)) {
 				/* only xsum need */
 				if (netif_msg_tx_queued(adapter))
@@ -2100,7 +2091,7 @@ static int atl1c_tso_csum(struct atl1c_adapter *adapter,
 			*tpd = atl1c_get_tpd(adapter, queue);
 			ipv6_hdr(skb)->payload_len = 0;
 			/* check payload == 0 byte ? */
-			hdr_len = (skb_transport_offset(skb) + tcp_hdrlen(skb));
+			hdr_len = skb_tcp_all_headers(skb);
 			if (unlikely(skb->len == hdr_len)) {
 				/* only xsum need */
 				if (netif_msg_tx_queued(adapter))
@@ -2161,7 +2152,7 @@ static void atl1c_tx_rollback(struct atl1c_adapter *adpt,
 	while (index != tpd_ring->next_to_use) {
 		tpd = ATL1C_TPD_DESC(tpd_ring, index);
 		buffer_info = &tpd_ring->buffer_info[index];
-		atl1c_clean_buffer(adpt->pdev, buffer_info);
+		atl1c_clean_buffer(adpt->pdev, buffer_info, 0);
 		memset(tpd, 0, sizeof(struct atl1c_tpd_desc));
 		if (++index == tpd_ring->count)
 			index = 0;
@@ -2187,7 +2178,8 @@ static int atl1c_tx_map(struct atl1c_adapter *adapter,
 	tso = (tpd->word1 >> TPD_LSO_EN_SHIFT) & TPD_LSO_EN_MASK;
 	if (tso) {
 		/* TSO */
-		map_len = hdr_len = skb_transport_offset(skb) + tcp_hdrlen(skb);
+		hdr_len = skb_tcp_all_headers(skb);
+		map_len = hdr_len;
 		use_tpd = tpd;
 
 		buffer_info = atl1c_get_tx_buffer(adapter, use_tpd);
@@ -2630,10 +2622,8 @@ static int atl1c_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	/* enable device (incl. PCI PM wakeup and hotplug setup) */
 	err = pci_enable_device_mem(pdev);
-	if (err) {
-		dev_err(&pdev->dev, "cannot enable PCI device\n");
-		return err;
-	}
+	if (err)
+		return dev_err_probe(&pdev->dev, err, "cannot enable PCI device\n");
 
 	/*
 	 * The atl1c chip can DMA to 64-bit addresses, but it uses a single
@@ -2698,13 +2688,13 @@ static int atl1c_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	adapter->mii.mdio_write = atl1c_mdio_write;
 	adapter->mii.phy_id_mask = 0x1f;
 	adapter->mii.reg_num_mask = MDIO_CTRL_REG_MASK;
-	dev_set_threaded(netdev, true);
+	netif_threaded_enable(netdev);
 	for (i = 0; i < adapter->rx_queue_count; ++i)
 		netif_napi_add(netdev, &adapter->rrd_ring[i].napi,
-			       atl1c_clean_rx, 64);
+			       atl1c_clean_rx);
 	for (i = 0; i < adapter->tx_queue_count; ++i)
-		netif_napi_add(netdev, &adapter->tpd_ring[i].napi,
-			       atl1c_clean_tx, 64);
+		netif_napi_add_tx(netdev, &adapter->tpd_ring[i].napi,
+				  atl1c_clean_tx);
 	timer_setup(&adapter->phy_config_timer, atl1c_phy_config, 0);
 	/* setup the private structure */
 	err = atl1c_sw_init(adapter);
@@ -2737,7 +2727,7 @@ static int atl1c_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		/* got a random MAC address, set NET_ADDR_RANDOM to netdev */
 		netdev->addr_assign_type = NET_ADDR_RANDOM;
 	}
-	memcpy(netdev->dev_addr, adapter->hw.mac_addr, netdev->addr_len);
+	eth_hw_addr_set(netdev, adapter->hw.mac_addr);
 	if (netif_msg_probe(adapter))
 		dev_dbg(&pdev->dev, "mac address : %pM\n",
 			adapter->hw.mac_addr);
@@ -2819,7 +2809,7 @@ static pci_ers_result_t atl1c_io_error_detected(struct pci_dev *pdev,
 
 	pci_disable_device(pdev);
 
-	/* Request a slot slot reset. */
+	/* Request a slot reset. */
 	return PCI_ERS_RESULT_NEED_RESET;
 }
 

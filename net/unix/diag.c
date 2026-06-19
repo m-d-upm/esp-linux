@@ -1,42 +1,50 @@
 // SPDX-License-Identifier: GPL-2.0-only
-#include <linux/types.h>
-#include <linux/spinlock.h>
-#include <linux/sock_diag.h>
-#include <linux/unix_diag.h>
-#include <linux/skbuff.h>
+
+#include <linux/dcache.h>
 #include <linux/module.h>
-#include <linux/uidgid.h>
-#include <net/netlink.h>
+#include <linux/skbuff.h>
+#include <linux/sock_diag.h>
+#include <linux/types.h>
+#include <linux/user_namespace.h>
 #include <net/af_unix.h>
+#include <net/netlink.h>
 #include <net/tcp_states.h>
-#include <net/sock.h>
+#include <uapi/linux/unix_diag.h>
+
+#include "af_unix.h"
 
 static int sk_diag_dump_name(struct sock *sk, struct sk_buff *nlskb)
 {
-	/* might or might not have unix_table_lock */
+	/* might or might not have a hash table lock */
 	struct unix_address *addr = smp_load_acquire(&unix_sk(sk)->addr);
 
 	if (!addr)
 		return 0;
 
-	return nla_put(nlskb, UNIX_DIAG_NAME, addr->len - sizeof(short),
+	return nla_put(nlskb, UNIX_DIAG_NAME,
+		       addr->len - offsetof(struct sockaddr_un, sun_path),
 		       addr->name->sun_path);
 }
 
 static int sk_diag_dump_vfs(struct sock *sk, struct sk_buff *nlskb)
 {
-	struct dentry *dentry = unix_sk(sk)->path.dentry;
+	struct unix_diag_vfs uv;
+	struct dentry *dentry;
+	bool have_vfs = false;
 
+	unix_state_lock(sk);
+	dentry = unix_sk(sk)->path.dentry;
 	if (dentry) {
-		struct unix_diag_vfs uv = {
-			.udiag_vfs_ino = d_backing_inode(dentry)->i_ino,
-			.udiag_vfs_dev = dentry->d_sb->s_dev,
-		};
-
-		return nla_put(nlskb, UNIX_DIAG_VFS, sizeof(uv), &uv);
+		uv.udiag_vfs_ino = d_backing_inode(dentry)->i_ino;
+		uv.udiag_vfs_dev = dentry->d_sb->s_dev;
+		have_vfs = true;
 	}
+	unix_state_unlock(sk);
 
-	return 0;
+	if (!have_vfs)
+		return 0;
+
+	return nla_put(nlskb, UNIX_DIAG_VFS, sizeof(uv), &uv);
 }
 
 static int sk_diag_dump_peer(struct sock *sk, struct sk_buff *nlskb)
@@ -46,9 +54,7 @@ static int sk_diag_dump_peer(struct sock *sk, struct sk_buff *nlskb)
 
 	peer = unix_peer_get(sk);
 	if (peer) {
-		unix_state_lock(peer);
 		ino = sock_i_ino(peer);
-		unix_state_unlock(peer);
 		sock_put(peer);
 
 		return nla_put_u32(nlskb, UNIX_DIAG_PEER, ino);
@@ -74,20 +80,9 @@ static int sk_diag_dump_icons(struct sock *sk, struct sk_buff *nlskb)
 
 		buf = nla_data(attr);
 		i = 0;
-		skb_queue_walk(&sk->sk_receive_queue, skb) {
-			struct sock *req, *peer;
+		skb_queue_walk(&sk->sk_receive_queue, skb)
+			buf[i++] = sock_i_ino(unix_peer(skb->sk));
 
-			req = skb->sk;
-			/*
-			 * The state lock is outer for the same sk's
-			 * queue lock. With the other's queue locked it's
-			 * OK to lock the state.
-			 */
-			unix_state_lock_nested(req, U_LOCK_DIAG);
-			peer = unix_sk(req)->peer;
-			buf[i++] = (peer ? sock_i_ino(peer) : 0);
-			unix_state_unlock(req);
-		}
 		spin_unlock(&sk->sk_receive_queue.lock);
 	}
 
@@ -116,7 +111,7 @@ static int sk_diag_show_rqlen(struct sock *sk, struct sk_buff *nlskb)
 static int sk_diag_dump_uid(struct sock *sk, struct sk_buff *nlskb,
 			    struct user_namespace *user_ns)
 {
-	uid_t uid = from_kuid_munged(user_ns, sock_i_uid(sk));
+	uid_t uid = from_kuid_munged(user_ns, sk_uid(sk));
 	return nla_put(nlskb, UNIX_DIAG_UID, sizeof(uid_t), &uid);
 }
 
@@ -179,81 +174,70 @@ out_nlmsg_trim:
 	return -EMSGSIZE;
 }
 
-static int sk_diag_dump(struct sock *sk, struct sk_buff *skb, struct unix_diag_req *req,
-			struct user_namespace *user_ns,
-			u32 portid, u32 seq, u32 flags)
-{
-	int sk_ino;
-
-	unix_state_lock(sk);
-	sk_ino = sock_i_ino(sk);
-	unix_state_unlock(sk);
-
-	if (!sk_ino)
-		return 0;
-
-	return sk_diag_fill(sk, skb, req, user_ns, portid, seq, flags, sk_ino);
-}
-
 static int unix_diag_dump(struct sk_buff *skb, struct netlink_callback *cb)
 {
-	struct unix_diag_req *req;
-	int num, s_num, slot, s_slot;
 	struct net *net = sock_net(skb->sk);
+	int num, s_num, slot, s_slot;
+	struct unix_diag_req *req;
 
 	req = nlmsg_data(cb->nlh);
 
 	s_slot = cb->args[0];
 	num = s_num = cb->args[1];
 
-	spin_lock(&unix_table_lock);
-	for (slot = s_slot;
-	     slot < ARRAY_SIZE(unix_socket_table);
-	     s_num = 0, slot++) {
+	for (slot = s_slot; slot < UNIX_HASH_SIZE; s_num = 0, slot++) {
 		struct sock *sk;
 
 		num = 0;
-		sk_for_each(sk, &unix_socket_table[slot]) {
-			if (!net_eq(sock_net(sk), net))
-				continue;
+		spin_lock(&net->unx.table.locks[slot]);
+		sk_for_each(sk, &net->unx.table.buckets[slot]) {
+			int sk_ino;
+
 			if (num < s_num)
 				goto next;
+
 			if (!(req->udiag_states & (1 << READ_ONCE(sk->sk_state))))
 				goto next;
-			if (sk_diag_dump(sk, skb, req, sk_user_ns(skb->sk),
+
+			sk_ino = sock_i_ino(sk);
+			if (!sk_ino)
+				goto next;
+
+			if (sk_diag_fill(sk, skb, req, sk_user_ns(skb->sk),
 					 NETLINK_CB(cb->skb).portid,
 					 cb->nlh->nlmsg_seq,
-					 NLM_F_MULTI) < 0)
+					 NLM_F_MULTI, sk_ino) < 0) {
+				spin_unlock(&net->unx.table.locks[slot]);
 				goto done;
+			}
 next:
 			num++;
 		}
+		spin_unlock(&net->unx.table.locks[slot]);
 	}
 done:
-	spin_unlock(&unix_table_lock);
 	cb->args[0] = slot;
 	cb->args[1] = num;
 
 	return skb->len;
 }
 
-static struct sock *unix_lookup_by_ino(unsigned int ino)
+static struct sock *unix_lookup_by_ino(struct net *net, unsigned int ino)
 {
-	int i;
 	struct sock *sk;
+	int i;
 
-	spin_lock(&unix_table_lock);
-	for (i = 0; i < ARRAY_SIZE(unix_socket_table); i++) {
-		sk_for_each(sk, &unix_socket_table[i])
+	for (i = 0; i < UNIX_HASH_SIZE; i++) {
+		spin_lock(&net->unx.table.locks[i]);
+		sk_for_each(sk, &net->unx.table.buckets[i]) {
 			if (ino == sock_i_ino(sk)) {
 				sock_hold(sk);
-				spin_unlock(&unix_table_lock);
-
+				spin_unlock(&net->unx.table.locks[i]);
 				return sk;
 			}
+		}
+		spin_unlock(&net->unx.table.locks[i]);
 	}
-
-	spin_unlock(&unix_table_lock);
 	return NULL;
 }
 
@@ -261,21 +245,20 @@ static int unix_diag_get_exact(struct sk_buff *in_skb,
 			       const struct nlmsghdr *nlh,
 			       struct unix_diag_req *req)
 {
-	int err = -EINVAL;
-	struct sock *sk;
-	struct sk_buff *rep;
-	unsigned int extra_len;
 	struct net *net = sock_net(in_skb->sk);
+	unsigned int extra_len;
+	struct sk_buff *rep;
+	struct sock *sk;
+	int err;
 
+	err = -EINVAL;
 	if (req->udiag_ino == 0)
 		goto out_nosk;
 
-	sk = unix_lookup_by_ino(req->udiag_ino);
+	sk = unix_lookup_by_ino(net, req->udiag_ino);
 	err = -ENOENT;
 	if (sk == NULL)
 		goto out_nosk;
-	if (!net_eq(sock_net(sk), net))
-		goto out;
 
 	err = sock_diag_check_cookie(sk, req->udiag_cookie);
 	if (err)
@@ -311,7 +294,6 @@ out_nosk:
 static int unix_diag_handler_dump(struct sk_buff *skb, struct nlmsghdr *h)
 {
 	int hdrlen = sizeof(struct unix_diag_req);
-	struct net *net = sock_net(skb->sk);
 
 	if (nlmsg_len(h) < hdrlen)
 		return -EINVAL;
@@ -320,12 +302,13 @@ static int unix_diag_handler_dump(struct sk_buff *skb, struct nlmsghdr *h)
 		struct netlink_dump_control c = {
 			.dump = unix_diag_dump,
 		};
-		return netlink_dump_start(net->diag_nlsk, skb, h, &c);
+		return netlink_dump_start(sock_net(skb->sk)->diag_nlsk, skb, h, &c);
 	} else
 		return unix_diag_get_exact(skb, h, nlmsg_data(h));
 }
 
 static const struct sock_diag_handler unix_diag_handler = {
+	.owner = THIS_MODULE,
 	.family = AF_UNIX,
 	.dump = unix_diag_handler_dump,
 };
@@ -343,4 +326,5 @@ static void __exit unix_diag_exit(void)
 module_init(unix_diag_init);
 module_exit(unix_diag_exit);
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("UNIX socket monitoring via SOCK_DIAG");
 MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_NETLINK, NETLINK_SOCK_DIAG, 1 /* AF_LOCAL */);

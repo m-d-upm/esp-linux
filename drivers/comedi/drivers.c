@@ -17,8 +17,7 @@
 #include <linux/dma-direction.h>
 #include <linux/interrupt.h>
 #include <linux/firmware.h>
-
-#include "comedidev.h"
+#include <linux/comedi/comedidev.h>
 #include "comedi_internal.h"
 
 struct comedi_driver *comedi_drivers;
@@ -178,7 +177,8 @@ static void comedi_device_detach_cleanup(struct comedi_device *dev)
 		dev->n_subdevices = 0;
 	}
 	kfree(dev->private);
-	kfree(dev->pacer);
+	if (!IS_ERR(dev->pacer))
+		kfree(dev->pacer);
 	dev->private = NULL;
 	dev->pacer = NULL;
 	dev->driver = NULL;
@@ -866,7 +866,7 @@ int comedi_load_firmware(struct comedi_device *dev,
 		release_firmware(fw);
 	}
 
-	return ret < 0 ? ret : 0;
+	return min(ret, 0);
 }
 EXPORT_SYMBOL_GPL(comedi_load_firmware);
 
@@ -1000,6 +1000,14 @@ int comedi_device_attach(struct comedi_device *dev, struct comedi_devconfig *it)
 		module_put(driv->module);
 		ret = -EIO;
 		goto out;
+	}
+	if (IS_ENABLED(CONFIG_LOCKDEP)) {
+		/*
+		 * dev->spinlock is for private use by the attached low-level
+		 * driver.  Reinitialize it to stop lock-dependency tracking
+		 * between attachments to different low-level drivers.
+		 */
+		spin_lock_init(&dev->spinlock);
 	}
 	dev->driver = driv;
 	dev->board_name = dev->board_ptr ? *(const char **)dev->board_ptr

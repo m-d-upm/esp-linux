@@ -26,8 +26,6 @@
 #include <linux/sysfb.h>
 #include <video/vga.h>
 
-#include <asm/efi.h>
-
 enum {
 	OVERRIDE_NONE = 0x0,
 	OVERRIDE_BASE = 0x1,
@@ -339,7 +337,7 @@ static int efifb_add_links(struct fwnode_handle *fwnode)
 	if (!sup_np)
 		return 0;
 
-	fwnode_link_add(fwnode, of_fwnode_handle(sup_np));
+	fwnode_link_add(fwnode, of_fwnode_handle(sup_np), 0);
 	of_node_put(sup_np);
 
 	return 0;

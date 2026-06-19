@@ -12,8 +12,6 @@
 #include <linux/errno.h>
 #include <linux/device.h>
 #include <linux/i2c.h>
-#include <linux/gpio.h>
-#include <linux/of_gpio.h>
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
@@ -140,7 +138,6 @@ static const struct snd_soc_dapm_route tas2552_audio_map[] = {
 	{"ASI OUT", NULL, "DMIC"}
 };
 
-#ifdef CONFIG_PM
 static void tas2552_sw_shutdown(struct tas2552_data *tas2552, int sw_shutdown)
 {
 	u8 cfg1_reg = 0;
@@ -154,7 +151,6 @@ static void tas2552_sw_shutdown(struct tas2552_data *tas2552, int sw_shutdown)
 	snd_soc_component_update_bits(tas2552->component, TAS2552_CFG_1, TAS2552_SWS,
 			    cfg1_reg);
 }
-#endif
 
 static int tas2552_setup_pll(struct snd_soc_component *component,
 			     struct snd_pcm_hw_params *params)
@@ -351,17 +347,17 @@ static int tas2552_set_dai_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	struct tas2552_data *tas2552 = dev_get_drvdata(component->dev);
 	u8 serial_format;
 
-	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
-	case SND_SOC_DAIFMT_CBS_CFS:
+	switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
+	case SND_SOC_DAIFMT_CBC_CFC:
 		serial_format = 0x00;
 		break;
-	case SND_SOC_DAIFMT_CBS_CFM:
+	case SND_SOC_DAIFMT_CBC_CFP:
 		serial_format = TAS2552_WCLKDIR;
 		break;
-	case SND_SOC_DAIFMT_CBM_CFS:
+	case SND_SOC_DAIFMT_CBP_CFC:
 		serial_format = TAS2552_BCLKDIR;
 		break;
-	case SND_SOC_DAIFMT_CBM_CFM:
+	case SND_SOC_DAIFMT_CBP_CFP:
 		serial_format = (TAS2552_BCLKDIR | TAS2552_WCLKDIR);
 		break;
 	default:
@@ -482,7 +478,6 @@ static int tas2552_mute(struct snd_soc_dai *dai, int mute, int direction)
 	return 0;
 }
 
-#ifdef CONFIG_PM
 static int tas2552_runtime_suspend(struct device *dev)
 {
 	struct tas2552_data *tas2552 = dev_get_drvdata(dev);
@@ -510,11 +505,9 @@ static int tas2552_runtime_resume(struct device *dev)
 
 	return 0;
 }
-#endif
 
 static const struct dev_pm_ops tas2552_pm = {
-	SET_RUNTIME_PM_OPS(tas2552_runtime_suspend, tas2552_runtime_resume,
-			   NULL)
+	RUNTIME_PM_OPS(tas2552_runtime_suspend, tas2552_runtime_resume, NULL)
 };
 
 static const struct snd_soc_dai_ops tas2552_speaker_dai_ops = {
@@ -592,7 +585,7 @@ static int tas2552_component_probe(struct snd_soc_component *component)
 
 	gpiod_set_value(tas2552->enable_gpio, 1);
 
-	ret = pm_runtime_get_sync(component->dev);
+	ret = pm_runtime_resume_and_get(component->dev);
 	if (ret < 0) {
 		dev_err(component->dev, "Enabling device failed: %d\n",
 			ret);
@@ -679,7 +672,6 @@ static const struct snd_soc_component_driver soc_component_dev_tas2552 = {
 	.num_dapm_routes	= ARRAY_SIZE(tas2552_audio_map),
 	.idle_bias_on		= 1,
 	.endianness		= 1,
-	.non_legacy_dai_naming	= 1,
 };
 
 static const struct regmap_config tas2552_regmap_config = {
@@ -692,8 +684,7 @@ static const struct regmap_config tas2552_regmap_config = {
 	.cache_type = REGCACHE_RBTREE,
 };
 
-static int tas2552_probe(struct i2c_client *client,
-			   const struct i2c_device_id *id)
+static int tas2552_probe(struct i2c_client *client)
 {
 	struct device *dev;
 	struct tas2552_data *data;
@@ -733,7 +724,6 @@ static int tas2552_probe(struct i2c_client *client,
 	pm_runtime_set_autosuspend_delay(&client->dev, 1000);
 	pm_runtime_use_autosuspend(&client->dev);
 	pm_runtime_enable(&client->dev);
-	pm_runtime_mark_last_busy(&client->dev);
 	pm_runtime_put_sync_autosuspend(&client->dev);
 
 	dev_set_drvdata(&client->dev, data);
@@ -749,14 +739,13 @@ static int tas2552_probe(struct i2c_client *client,
 	return ret;
 }
 
-static int tas2552_i2c_remove(struct i2c_client *client)
+static void tas2552_i2c_remove(struct i2c_client *client)
 {
 	pm_runtime_disable(&client->dev);
-	return 0;
 }
 
 static const struct i2c_device_id tas2552_id[] = {
-	{ "tas2552", 0 },
+	{ "tas2552" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, tas2552_id);
@@ -773,7 +762,7 @@ static struct i2c_driver tas2552_i2c_driver = {
 	.driver = {
 		.name = "tas2552",
 		.of_match_table = of_match_ptr(tas2552_of_match),
-		.pm = &tas2552_pm,
+		.pm = pm_ptr(&tas2552_pm),
 	},
 	.probe = tas2552_probe,
 	.remove = tas2552_i2c_remove,

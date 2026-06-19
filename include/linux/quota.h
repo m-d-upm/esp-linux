@@ -91,7 +91,7 @@ extern bool qid_valid(struct kqid qid);
  *
  *	When there is no mapping defined for the user-namespace, type,
  *	qid tuple an invalid kqid is returned.  Callers are expected to
- *	test for and handle handle invalid kqids being returned.
+ *	test for and handle invalid kqids being returned.
  *	Invalid kqids may be tested for using qid_valid().
  */
 static inline struct kqid make_kqid(struct user_namespace *from,
@@ -526,7 +526,7 @@ struct quota_info {
 	const struct quota_format_ops *ops[MAXQUOTAS];	/* Operations for each type */
 };
 
-int register_quota_format(struct quota_format_type *fmt);
+void register_quota_format(struct quota_format_type *fmt);
 void unregister_quota_format(struct quota_format_type *fmt);
 
 struct quota_module_name {

@@ -7,12 +7,13 @@
 
 #include <linux/errno.h>
 #include <linux/init.h>
-#include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/kmod.h>
 #include <linux/ktime.h>
-#include <linux/slab.h>
 #include <linux/mm.h>
+#include <linux/module.h>
+#include <linux/seq_file.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/types.h>
 
@@ -26,18 +27,6 @@
 static void cec_fill_msg_report_features(struct cec_adapter *adap,
 					 struct cec_msg *msg,
 					 unsigned int la_idx);
-
-/*
- * 400 ms is the time it takes for one 16 byte message to be
- * transferred and 5 is the maximum number of retries. Add
- * another 100 ms as a margin. So if the transmit doesn't
- * finish before that time something is really wrong and we
- * have to time out.
- *
- * This is a sign that something it really wrong and a warning
- * will be issued.
- */
-#define CEC_XFER_TIMEOUT_MS (5 * 400 + 100)
 
 static int cec_log_addr2idx(const struct cec_adapter *adap, u8 log_addr)
 {
@@ -334,7 +323,7 @@ static void cec_data_completed(struct cec_data *data)
 	 * Without that we would be referring to a closed filehandle.
 	 */
 	if (data->fh)
-		list_del(&data->xfer_list);
+		list_del_init(&data->xfer_list);
 
 	if (data->blocking) {
 		/*
@@ -483,7 +472,7 @@ int cec_thread_func(void *_adap)
 				kthread_should_stop() ||
 				(!adap->transmit_in_progress &&
 				 !list_empty(&adap->transmit_queue)),
-				msecs_to_jiffies(CEC_XFER_TIMEOUT_MS));
+				msecs_to_jiffies(adap->xfer_timeout_ms));
 			timeout = err == 0;
 		} else {
 			/* Otherwise we just wait for something to happen. */
@@ -518,7 +507,8 @@ int cec_thread_func(void *_adap)
 			 * adapter driver, or the CEC bus is in some weird
 			 * state. On rare occasions it can happen if there is
 			 * so much traffic on the bus that the adapter was
-			 * unable to transmit for CEC_XFER_TIMEOUT_MS (2.1s).
+			 * unable to transmit for xfer_timeout_ms (2.1s by
+			 * default).
 			 */
 			if (adap->transmitting) {
 				pr_warn("cec-%s: message %*ph timed out\n", adap->name,
@@ -531,7 +521,7 @@ int cec_thread_func(void *_adap)
 				pr_warn("cec-%s: transmit timed out\n", adap->name);
 			}
 			adap->transmit_in_progress = false;
-			adap->tx_timeouts++;
+			adap->tx_timeout_cnt++;
 			goto unlock;
 		}
 
@@ -645,6 +635,33 @@ void cec_transmit_done_ts(struct cec_adapter *adap, u8 status,
 	msg->tx_low_drive_cnt += low_drive_cnt;
 	msg->tx_error_cnt += error_cnt;
 
+	adap->tx_arb_lost_cnt += arb_lost_cnt;
+	adap->tx_low_drive_cnt += low_drive_cnt;
+	adap->tx_error_cnt += error_cnt;
+
+	/*
+	 * Low Drive transmission errors should really not happen for
+	 * well-behaved CEC devices and proper HDMI cables.
+	 *
+	 * Ditto for the 'Error' status.
+	 *
+	 * For the first few times that this happens, log this.
+	 * Stop logging after that, since that will not add any more
+	 * useful information and instead it will just flood the kernel log.
+	 */
+	if (done && adap->tx_low_drive_log_cnt < 8 && msg->tx_low_drive_cnt) {
+		adap->tx_low_drive_log_cnt++;
+		dprintk(0, "low drive counter: %u (seq %u: %*ph)\n",
+			msg->tx_low_drive_cnt, msg->sequence,
+			msg->len, msg->msg);
+	}
+	if (done && adap->tx_error_log_cnt < 8 && msg->tx_error_cnt) {
+		adap->tx_error_log_cnt++;
+		dprintk(0, "error counter: %u (seq %u: %*ph)\n",
+			msg->tx_error_cnt, msg->sequence,
+			msg->len, msg->msg);
+	}
+
 	/* Mark that we're done with this transmit */
 	adap->transmitting = NULL;
 
@@ -657,8 +674,9 @@ void cec_transmit_done_ts(struct cec_adapter *adap, u8 status,
 		/* Retry this message */
 		data->attempts -= attempts_made;
 		if (msg->timeout)
-			dprintk(2, "retransmit: %*ph (attempts: %d, wait for 0x%02x)\n",
-				msg->len, msg->msg, data->attempts, msg->reply);
+			dprintk(2, "retransmit: %*ph (attempts: %d, wait for %*ph)\n",
+				msg->len, msg->msg, data->attempts,
+				data->match_len, data->match_reply);
 		else
 			dprintk(2, "retransmit: %*ph (attempts: %d)\n",
 				msg->len, msg->msg, data->attempts);
@@ -764,6 +782,8 @@ int cec_transmit_msg_fh(struct cec_adapter *adap, struct cec_msg *msg,
 {
 	struct cec_data *data;
 	bool is_raw = msg_is_raw(msg);
+	bool reply_vendor_id = (msg->flags & CEC_MSG_FL_REPLY_VENDOR_ID) &&
+		msg->len > 1 && msg->msg[1] == CEC_MSG_VENDOR_COMMAND_WITH_ID;
 	int err;
 
 	if (adap->devnode.unregistered)
@@ -778,12 +798,13 @@ int cec_transmit_msg_fh(struct cec_adapter *adap, struct cec_msg *msg,
 	msg->tx_low_drive_cnt = 0;
 	msg->tx_error_cnt = 0;
 	msg->sequence = 0;
+	msg->flags &= CEC_MSG_FL_REPLY_TO_FOLLOWERS | CEC_MSG_FL_RAW |
+		      (reply_vendor_id ? CEC_MSG_FL_REPLY_VENDOR_ID : 0);
 
-	if (msg->reply && msg->timeout == 0) {
+	if ((reply_vendor_id || msg->reply) && msg->timeout == 0) {
 		/* Make sure the timeout isn't 0. */
 		msg->timeout = 1000;
 	}
-	msg->flags &= CEC_MSG_FL_REPLY_TO_FOLLOWERS | CEC_MSG_FL_RAW;
 
 	if (!msg->timeout)
 		msg->flags &= ~CEC_MSG_FL_REPLY_TO_FOLLOWERS;
@@ -791,6 +812,11 @@ int cec_transmit_msg_fh(struct cec_adapter *adap, struct cec_msg *msg,
 	/* Sanity checks */
 	if (msg->len == 0 || msg->len > CEC_MAX_MSG_SIZE) {
 		dprintk(1, "%s: invalid length %d\n", __func__, msg->len);
+		return -EINVAL;
+	}
+	if (reply_vendor_id && msg->len < 6) {
+		dprintk(1, "%s: <Vendor Command With ID> message too short\n",
+			__func__);
 		return -EINVAL;
 	}
 
@@ -884,8 +910,9 @@ int cec_transmit_msg_fh(struct cec_adapter *adap, struct cec_msg *msg,
 				__func__);
 			return -ENONET;
 		}
-		if (msg->reply) {
-			dprintk(1, "%s: invalid msg->reply\n", __func__);
+		if (reply_vendor_id || msg->reply) {
+			dprintk(1, "%s: adapter is unconfigured so reply is not supported\n",
+				__func__);
 			return -EINVAL;
 		}
 	}
@@ -907,12 +934,22 @@ int cec_transmit_msg_fh(struct cec_adapter *adap, struct cec_msg *msg,
 	data->fh = fh;
 	data->adap = adap;
 	data->blocking = block;
+	if (reply_vendor_id) {
+		memcpy(data->match_reply, msg->msg + 1, 4);
+		data->match_reply[4] = msg->reply;
+		data->match_len = 5;
+	} else if (msg->timeout) {
+		data->match_reply[0] = msg->reply;
+		data->match_len = 1;
+	}
 
 	init_completion(&data->c);
 	INIT_DELAYED_WORK(&data->work, cec_wait_timeout);
 
 	if (fh)
 		list_add_tail(&data->xfer_list, &fh->xfer_list);
+	else
+		INIT_LIST_HEAD(&data->xfer_list);
 
 	list_add_tail(&data->list, &adap->transmit_queue);
 	adap->transmit_queue_sz++;
@@ -944,6 +981,10 @@ int cec_transmit_msg_fh(struct cec_adapter *adap, struct cec_msg *msg,
 
 	/* The transmit completed (possibly with an error) */
 	*msg = data->msg;
+	if (WARN_ON(!list_empty(&data->list)))
+		list_del(&data->list);
+	if (WARN_ON(!list_empty(&data->xfer_list)))
+		list_del(&data->xfer_list);
 	kfree(data);
 	return 0;
 }
@@ -1044,6 +1085,7 @@ static const u8 cec_msg_size[256] = {
 	[CEC_MSG_REPORT_SHORT_AUDIO_DESCRIPTOR] = 2 | DIRECTED,
 	[CEC_MSG_REQUEST_SHORT_AUDIO_DESCRIPTOR] = 2 | DIRECTED,
 	[CEC_MSG_SET_SYSTEM_AUDIO_MODE] = 3 | BOTH,
+	[CEC_MSG_SET_AUDIO_VOLUME_LEVEL] = 3 | DIRECTED,
 	[CEC_MSG_SYSTEM_AUDIO_MODE_REQUEST] = 2 | DIRECTED,
 	[CEC_MSG_SYSTEM_AUDIO_MODE_STATUS] = 3 | DIRECTED,
 	[CEC_MSG_SET_AUDIO_RATE] = 3 | DIRECTED,
@@ -1068,6 +1110,7 @@ void cec_received_msg_ts(struct cec_adapter *adap,
 	u8 cmd = msg->msg[1];
 	bool is_reply = false;
 	bool valid_la = true;
+	bool monitor_valid_la = true;
 	u8 min_len = 0;
 
 	if (WARN_ON(!msg->len || msg->len > CEC_MAX_MSG_SIZE))
@@ -1110,8 +1153,10 @@ void cec_received_msg_ts(struct cec_adapter *adap,
 		adap->last_initiator = 0xff;
 
 	/* Check if this message was for us (directed or broadcast). */
-	if (!cec_msg_is_broadcast(msg))
+	if (!cec_msg_is_broadcast(msg)) {
 		valid_la = cec_has_log_addr(adap, msg_dest);
+		monitor_valid_la = valid_la;
+	}
 
 	/*
 	 * Check if the length is not too short or if the message is a
@@ -1185,13 +1230,15 @@ void cec_received_msg_ts(struct cec_adapter *adap,
 			if (!abort && dst->msg[1] == CEC_MSG_INITIATE_ARC &&
 			    (cmd == CEC_MSG_REPORT_ARC_INITIATED ||
 			     cmd == CEC_MSG_REPORT_ARC_TERMINATED) &&
-			    (dst->reply == CEC_MSG_REPORT_ARC_INITIATED ||
-			     dst->reply == CEC_MSG_REPORT_ARC_TERMINATED))
+			    (data->match_reply[0] == CEC_MSG_REPORT_ARC_INITIATED ||
+			     data->match_reply[0] == CEC_MSG_REPORT_ARC_TERMINATED)) {
 				dst->reply = cmd;
+				data->match_reply[0] = cmd;
+			}
 
 			/* Does the command match? */
 			if ((abort && cmd != dst->msg[1]) ||
-			    (!abort && cmd != dst->reply))
+			    (!abort && memcmp(data->match_reply, msg->msg + 1, data->match_len)))
 				continue;
 
 			/* Does the addressing match? */
@@ -1230,7 +1277,7 @@ void cec_received_msg_ts(struct cec_adapter *adap,
 	mutex_unlock(&adap->lock);
 
 	/* Pass the message on to any monitoring filehandles */
-	cec_queue_msg_monitor(adap, msg, valid_la);
+	cec_queue_msg_monitor(adap, msg, monitor_valid_la);
 
 	/* We're done if it is not for us or a poll message */
 	if (!valid_la || msg->len <= 1)
@@ -1282,14 +1329,19 @@ static int cec_config_log_addr(struct cec_adapter *adap,
 		if (adap->phys_addr == CEC_PHYS_ADDR_INVALID)
 			return -EINTR;
 
+		/* Also bail out if the PA changed while configuring. */
+		if (adap->must_reconfigure)
+			return -EINTR;
+
 		if (err)
 			return err;
 
 		/*
-		 * The message was aborted due to a disconnect or
+		 * The message was aborted or timed out due to a disconnect or
 		 * unconfigure, just bail out.
 		 */
-		if (msg.tx_status & CEC_TX_STATUS_ABORTED)
+		if (msg.tx_status &
+		    (CEC_TX_STATUS_ABORTED | CEC_TX_STATUS_TIMEOUT))
 			return -EINTR;
 		if (msg.tx_status & CEC_TX_STATUS_OK)
 			return 0;
@@ -1308,8 +1360,11 @@ static int cec_config_log_addr(struct cec_adapter *adap,
 	 * we assume that something is really weird and that it is not a
 	 * good idea to try and claim this logical address.
 	 */
-	if (i == max_retries)
+	if (i == max_retries) {
+		dprintk(0, "polling for LA %u failed with tx_status=0x%04x\n",
+			log_addr, msg.tx_status);
 		return 0;
+	}
 
 	/*
 	 * Message not acknowledged, so this logical
@@ -1339,6 +1394,7 @@ static void cec_adap_unconfigure(struct cec_adapter *adap)
 	cec_flush(adap);
 	wake_up_interruptible(&adap->kthread_waitq);
 	cec_post_state_event(adap);
+	call_void_op(adap, adap_unconfigured);
 }
 
 /*
@@ -1407,6 +1463,7 @@ static int cec_config_thread_func(void *arg)
 	if (las->log_addr_type[0] == CEC_LOG_ADDR_TYPE_UNREGISTERED)
 		goto configured;
 
+reconfigure:
 	for (i = 0; i < las->num_log_addrs; i++) {
 		unsigned int type = las->log_addr_type[i];
 		const u8 *la_list;
@@ -1429,6 +1486,13 @@ static int cec_config_thread_func(void *arg)
 			last_la = la_list[0];
 
 		err = cec_config_log_addr(adap, i, last_la);
+
+		if (adap->must_reconfigure) {
+			adap->must_reconfigure = false;
+			las->log_addr_mask = 0;
+			goto reconfigure;
+		}
+
 		if (err > 0) /* Reused last LA */
 			continue;
 
@@ -1474,6 +1538,7 @@ configured:
 		las->log_addr[i] = CEC_LOG_ADDR_INVALID;
 	adap->is_configured = true;
 	adap->is_configuring = false;
+	adap->must_reconfigure = false;
 	cec_post_state_event(adap);
 
 	/*
@@ -1520,6 +1585,7 @@ configured:
 	adap->kthread_config = NULL;
 	complete(&adap->config_completion);
 	mutex_unlock(&adap->lock);
+	call_void_op(adap, configured);
 	return 0;
 
 unconfigure:
@@ -1527,6 +1593,7 @@ unconfigure:
 		las->log_addr[i] = CEC_LOG_ADDR_INVALID;
 	cec_adap_unconfigure(adap);
 	adap->is_configuring = false;
+	adap->must_reconfigure = false;
 	adap->kthread_config = NULL;
 	complete(&adap->config_completion);
 	mutex_unlock(&adap->lock);
@@ -1569,7 +1636,7 @@ static void cec_claim_log_addrs(struct cec_adapter *adap, bool block)
  *
  * This function is called with adap->lock held.
  */
-static int cec_adap_enable(struct cec_adapter *adap)
+int cec_adap_enable(struct cec_adapter *adap)
 {
 	bool enable;
 	int ret = 0;
@@ -1579,6 +1646,9 @@ static int cec_adap_enable(struct cec_adapter *adap)
 	if (adap->needs_hpd)
 		enable = enable && adap->phys_addr != CEC_PHYS_ADDR_INVALID;
 
+	if (adap->devnode.unregistered)
+		enable = false;
+
 	if (enable == adap->is_enabled)
 		return 0;
 
@@ -1587,6 +1657,8 @@ static int cec_adap_enable(struct cec_adapter *adap)
 	if (enable) {
 		adap->last_initiator = 0xff;
 		adap->transmit_in_progress = false;
+		adap->tx_low_drive_log_cnt = 0;
+		adap->tx_error_log_cnt = 0;
 		ret = adap->ops->adap_enable(adap, true);
 		if (!ret) {
 			/*
@@ -1649,7 +1721,11 @@ void __cec_s_phys_addr(struct cec_adapter *adap, u16 phys_addr, bool block)
 		cec_adap_enable(adap);
 
 	cec_post_state_event(adap);
-	if (adap->log_addrs.num_log_addrs)
+	if (!adap->log_addrs.num_log_addrs)
+		return;
+	if (adap->is_configuring)
+		adap->must_reconfigure = true;
+	else
 		cec_claim_log_addrs(adap, block);
 }
 
@@ -1664,6 +1740,11 @@ void cec_s_phys_addr(struct cec_adapter *adap, u16 phys_addr, bool block)
 }
 EXPORT_SYMBOL_GPL(cec_s_phys_addr);
 
+/*
+ * Note: In the drm subsystem, prefer calling (if possible):
+ *
+ * cec_s_phys_addr(adap, connector->display_info.source_physical_address, false);
+ */
 void cec_s_phys_addr_from_edid(struct cec_adapter *adap,
 			       const struct edid *edid)
 {
@@ -1711,9 +1792,10 @@ int __cec_s_log_addrs(struct cec_adapter *adap,
 		return -ENODEV;
 
 	if (!log_addrs || log_addrs->num_log_addrs == 0) {
-		if (!adap->is_configuring && !adap->is_configured)
+		if (!adap->log_addrs.num_log_addrs)
 			return 0;
-		cec_adap_unconfigure(adap);
+		if (adap->is_configuring || adap->is_configured)
+			cec_adap_unconfigure(adap);
 		adap->log_addrs.num_log_addrs = 0;
 		for (i = 0; i < CEC_MAX_LOG_ADDRS; i++)
 			adap->log_addrs.log_addr[i] = CEC_LOG_ADDR_INVALID;
@@ -2235,25 +2317,43 @@ int cec_adap_status(struct seq_file *file, void *priv)
 	if (adap->monitor_pin_cnt)
 		seq_printf(file, "file handles in Monitor Pin mode: %u\n",
 			   adap->monitor_pin_cnt);
-	if (adap->tx_timeouts) {
-		seq_printf(file, "transmit timeouts: %u\n",
-			   adap->tx_timeouts);
-		adap->tx_timeouts = 0;
+	if (adap->tx_timeout_cnt) {
+		seq_printf(file, "transmit timeout count: %u\n",
+			   adap->tx_timeout_cnt);
+		adap->tx_timeout_cnt = 0;
+	}
+	if (adap->tx_low_drive_cnt) {
+		seq_printf(file, "transmit low drive count: %u\n",
+			   adap->tx_low_drive_cnt);
+		adap->tx_low_drive_cnt = 0;
+	}
+	if (adap->tx_arb_lost_cnt) {
+		seq_printf(file, "transmit arbitration lost count: %u\n",
+			   adap->tx_arb_lost_cnt);
+		adap->tx_arb_lost_cnt = 0;
+	}
+	if (adap->tx_error_cnt) {
+		seq_printf(file, "transmit error count: %u\n",
+			   adap->tx_error_cnt);
+		adap->tx_error_cnt = 0;
 	}
 	data = adap->transmitting;
 	if (data)
-		seq_printf(file, "transmitting message: %*ph (reply: %02x, timeout: %ums)\n",
-			   data->msg.len, data->msg.msg, data->msg.reply,
+		seq_printf(file, "transmitting message: %*ph (reply: %*ph, timeout: %ums)\n",
+			   data->msg.len, data->msg.msg,
+			   data->match_len, data->match_reply,
 			   data->msg.timeout);
 	seq_printf(file, "pending transmits: %u\n", adap->transmit_queue_sz);
 	list_for_each_entry(data, &adap->transmit_queue, list) {
-		seq_printf(file, "queued tx message: %*ph (reply: %02x, timeout: %ums)\n",
-			   data->msg.len, data->msg.msg, data->msg.reply,
+		seq_printf(file, "queued tx message: %*ph (reply: %*ph, timeout: %ums)\n",
+			   data->msg.len, data->msg.msg,
+			   data->match_len, data->match_reply,
 			   data->msg.timeout);
 	}
 	list_for_each_entry(data, &adap->wait_queue, list) {
-		seq_printf(file, "message waiting for reply: %*ph (reply: %02x, timeout: %ums)\n",
-			   data->msg.len, data->msg.msg, data->msg.reply,
+		seq_printf(file, "message waiting for reply: %*ph (reply: %*ph, timeout: %ums)\n",
+			   data->msg.len, data->msg.msg,
+			   data->match_len, data->match_reply,
 			   data->msg.timeout);
 	}
 

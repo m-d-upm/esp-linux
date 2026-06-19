@@ -531,7 +531,7 @@ static void kvm_mips_resume_hrtimer(struct kvm_vcpu *vcpu,
  * to be used for a period of time, but the exact ktime corresponding to the
  * final Count that must be restored is not known.
  *
- * It is gauranteed that a timer interrupt immediately after restore will be
+ * It is guaranteed that a timer interrupt immediately after restore will be
  * handled, but not if CP0_Compare is exactly at @count. That case should
  * already be handled when the hardware timer state is saved.
  *
@@ -952,16 +952,14 @@ enum emulation_result kvm_mips_emul_wait(struct kvm_vcpu *vcpu)
 	if (!vcpu->arch.pending_exceptions) {
 		kvm_vz_lose_htimer(vcpu);
 		vcpu->arch.wait = 1;
-		kvm_vcpu_block(vcpu);
+		kvm_vcpu_halt(vcpu);
 
 		/*
-		 * We we are runnable, then definitely go off to user space to
+		 * We are runnable, then definitely go off to user space to
 		 * check if any I/O interrupts are pending.
 		 */
-		if (kvm_check_request(KVM_REQ_UNHALT, vcpu)) {
-			kvm_clear_request(KVM_REQ_UNHALT, vcpu);
+		if (kvm_arch_vcpu_runnable(vcpu))
 			vcpu->run->exit_reason = KVM_EXIT_IRQ_WINDOW_OPEN;
-		}
 	}
 
 	return EMULATE_DONE;

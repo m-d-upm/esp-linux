@@ -13,7 +13,6 @@
 /* RVU LMTST */
 #define LMT_TBL_OP_READ		0
 #define LMT_TBL_OP_WRITE	1
-#define LMT_MAP_TABLE_SIZE	(128 * 1024)
 #define LMT_MAPTBL_ENTRY_SIZE	16
 #define LMT_MAX_VFS		256
 
@@ -26,10 +25,14 @@ static int lmtst_map_table_ops(struct rvu *rvu, u32 index, u64 *val,
 {
 	void __iomem *lmt_map_base;
 	u64 tbl_base, cfg;
+	int pfs, vfs;
 
 	tbl_base = rvu_read64(rvu, BLKADDR_APR, APR_AF_LMT_MAP_BASE);
+	cfg  = rvu_read64(rvu, BLKADDR_APR, APR_AF_LMT_CFG);
+	vfs = 1 << (cfg & 0xF);
+	pfs = 1 << ((cfg >> 4) & 0x7);
 
-	lmt_map_base = ioremap_wc(tbl_base, LMT_MAP_TABLE_SIZE);
+	lmt_map_base = ioremap_wc(tbl_base, pfs * vfs * LMT_MAPTBL_ENTRY_SIZE);
 	if (!lmt_map_base) {
 		dev_err(rvu->dev, "Failed to setup lmt map table mapping!!\n");
 		return -ENOMEM;
@@ -63,7 +66,7 @@ static int lmtst_map_table_ops(struct rvu *rvu, u32 index, u64 *val,
 #define LMT_MAP_TBL_W1_OFF  8
 static u32 rvu_get_lmtst_tbl_index(struct rvu *rvu, u16 pcifunc)
 {
-	return ((rvu_get_pf(pcifunc) * LMT_MAX_VFS) +
+	return ((rvu_get_pf(rvu->pdev, pcifunc) * LMT_MAX_VFS) +
 		(pcifunc & RVU_PFVF_FUNC_MASK)) * LMT_MAPTBL_ENTRY_SIZE;
 }
 
@@ -80,7 +83,7 @@ static int rvu_get_lmtaddr(struct rvu *rvu, u16 pcifunc,
 
 	mutex_lock(&rvu->rsrc_lock);
 	rvu_write64(rvu, BLKADDR_RVUM, RVU_AF_SMMU_ADDR_REQ, iova);
-	pf = rvu_get_pf(pcifunc) & 0x1F;
+	pf = rvu_get_pf(rvu->pdev, pcifunc) & RVU_OTX2_PFVF_PF_MASK;
 	val = BIT_ULL(63) | BIT_ULL(14) | BIT_ULL(13) | pf << 8 |
 	      ((pcifunc & RVU_PFVF_FUNC_MASK) & 0xFF);
 	rvu_write64(rvu, BLKADDR_RVUM, RVU_AF_SMMU_TXN_REQ, val);
@@ -152,7 +155,7 @@ int rvu_mbox_handler_lmtst_tbl_setup(struct rvu *rvu,
 	int err = 0;
 	u64 val;
 
-	/* Check if PF_FUNC wants to use it's own local memory as LMTLINE
+	/* Check if PF_FUNC wants to use its own local memory as LMTLINE
 	 * region, if so, convert that IOVA to physical address and
 	 * populate LMT table with that address
 	 */
@@ -348,8 +351,8 @@ int rvu_set_channels_base(struct rvu *rvu)
 	/* Out of 4096 channels start CPT from 2048 so
 	 * that MSB for CPT channels is always set
 	 */
-	if (cpt_chan_base <= 0x800) {
-		hw->cpt_chan_base = 0x800;
+	if (cpt_chan_base <= NIX_CHAN_CPT_CH_START) {
+		hw->cpt_chan_base = NIX_CHAN_CPT_CH_START;
 	} else {
 		dev_err(rvu->dev,
 			"CPT channels could not fit in the range 2048-4095\n");
@@ -551,4 +554,31 @@ void rvu_program_channels(struct rvu *rvu)
 	rvu_nix_set_channels(rvu);
 	rvu_lbk_set_channels(rvu);
 	rvu_rpm_set_channels(rvu);
+}
+
+void rvu_nix_block_cn10k_init(struct rvu *rvu, struct nix_hw *nix_hw)
+{
+	int blkaddr = nix_hw->blkaddr;
+	u64 cfg;
+
+	/* Set AF vWQE timer interval to a LF configurable range of
+	 * 6.4us to 1.632ms.
+	 */
+	rvu_write64(rvu, blkaddr, NIX_AF_VWQE_TIMER, 0x3FULL);
+
+	/* Enable NIX RX stream and global conditional clock to
+	 * avoild multiple free of NPA buffers.
+	 */
+	cfg = rvu_read64(rvu, blkaddr, NIX_AF_CFG);
+	cfg |= BIT_ULL(1) | BIT_ULL(2);
+	rvu_write64(rvu, blkaddr, NIX_AF_CFG, cfg);
+}
+
+void rvu_apr_block_cn10k_init(struct rvu *rvu)
+{
+	u64 reg;
+
+	reg = rvu_read64(rvu, BLKADDR_APR, APR_AF_LMT_CFG);
+	reg |=	FIELD_PREP(LMTST_THROTTLE_MASK, LMTST_WR_PEND_MAX);
+	rvu_write64(rvu, BLKADDR_APR, APR_AF_LMT_CFG, reg);
 }

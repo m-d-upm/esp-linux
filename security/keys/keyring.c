@@ -79,7 +79,7 @@ static void keyring_revoke(struct key *keyring);
 static void keyring_destroy(struct key *keyring);
 static void keyring_describe(const struct key *keyring, struct seq_file *m);
 static long keyring_read(const struct key *keyring,
-			 char __user *buffer, size_t buflen);
+			 char *buffer, size_t buflen);
 
 struct key_type key_type_keyring = {
 	.name		= "keyring",
@@ -1109,6 +1109,7 @@ key_ref_t find_key_to_update(key_ref_t keyring_ref,
 	kenter("{%d},{%s,%s}",
 	       keyring->serial, index_key->type->name, index_key->description);
 
+	guard(rcu)();
 	object = assoc_array_find(&keyring->keys, &keyring_assoc_array_ops,
 				  index_key);
 

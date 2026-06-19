@@ -55,13 +55,13 @@ struct ext4_fc_del_range {
 struct ext4_fc_dentry_info {
 	__le32 fc_parent_ino;
 	__le32 fc_ino;
-	__u8 fc_dname[0];
+	__u8 fc_dname[];
 };
 
 /* Value structure for EXT4_FC_TAG_INODE. */
 struct ext4_fc_inode {
 	__le32 fc_ino;
-	__u8 fc_raw_inode[0];
+	__u8 fc_raw_inode[];
 };
 
 /* Value structure for tag EXT4_FC_TAG_TAIL. */
@@ -109,9 +109,9 @@ struct ext4_fc_dentry_update {
 	int fcd_op;		/* Type of update create / unlink / link */
 	int fcd_parent;		/* Parent inode number */
 	int fcd_ino;		/* Inode number */
-	struct qstr fcd_name;	/* Dirent name */
-	unsigned char fcd_iname[DNAME_INLINE_LEN];	/* Dirent name string */
+	struct name_snapshot fcd_name;	/* Dirent name */
 	struct list_head fcd_list;
+	struct list_head fcd_dilist;
 };
 
 struct ext4_fc_stats {

@@ -95,7 +95,7 @@ static int ext4_orphan_file_add(handle_t *handle, struct inode *inode)
  * At filesystem recovery time, we walk this list deleting unlinked
  * inodes and truncating linked inodes in ext4_orphan_cleanup().
  *
- * Orphan list manipulation functions must be called under i_mutex unless
+ * Orphan list manipulation functions must be called under i_rwsem unless
  * we are just creating the inode or deleting it.
  */
 int ext4_orphan_add(handle_t *handle, struct inode *inode)
@@ -117,7 +117,7 @@ int ext4_orphan_add(handle_t *handle, struct inode *inode)
 	/*
 	 * Orphan handling is only valid for files with data blocks
 	 * being truncated, or files being unlinked. Note that we either
-	 * hold i_mutex, or the inode can not be referenced from outside,
+	 * hold i_rwsem, or the inode can not be referenced from outside,
 	 * so i_nlink should not be bumped due to race
 	 */
 	ASSERT((S_ISREG(inode->i_mode) || S_ISDIR(inode->i_mode) ||
@@ -535,13 +535,13 @@ static int ext4_orphan_file_block_csum_verify(struct super_block *sb,
 	struct ext4_orphan_block_tail *ot;
 	__le64 dsk_block_nr = cpu_to_le64(bh->b_blocknr);
 
-	if (!ext4_has_metadata_csum(sb))
+	if (!ext4_has_feature_metadata_csum(sb))
 		return 1;
 
 	ot = ext4_orphan_block_tail(sb, bh);
-	calculated = ext4_chksum(EXT4_SB(sb), oi->of_csum_seed,
-				 (__u8 *)&dsk_block_nr, sizeof(dsk_block_nr));
-	calculated = ext4_chksum(EXT4_SB(sb), calculated, (__u8 *)bh->b_data,
+	calculated = ext4_chksum(oi->of_csum_seed, (__u8 *)&dsk_block_nr,
+				 sizeof(dsk_block_nr));
+	calculated = ext4_chksum(calculated, (__u8 *)bh->b_data,
 				 inodes_per_ob * sizeof(__u32));
 	return le32_to_cpu(ot->ob_checksum) == calculated;
 }
@@ -558,10 +558,9 @@ void ext4_orphan_file_block_trigger(struct jbd2_buffer_trigger_type *triggers,
 	struct ext4_orphan_block_tail *ot;
 	__le64 dsk_block_nr = cpu_to_le64(bh->b_blocknr);
 
-	csum = ext4_chksum(EXT4_SB(sb), oi->of_csum_seed,
-			   (__u8 *)&dsk_block_nr, sizeof(dsk_block_nr));
-	csum = ext4_chksum(EXT4_SB(sb), csum, (__u8 *)data,
-			   inodes_per_ob * sizeof(__u32));
+	csum = ext4_chksum(oi->of_csum_seed, (__u8 *)&dsk_block_nr,
+			   sizeof(dsk_block_nr));
+	csum = ext4_chksum(csum, (__u8 *)data, inodes_per_ob * sizeof(__u32));
 	ot = ext4_orphan_block_tail(sb, bh);
 	ot->ob_checksum = cpu_to_le32(csum);
 }

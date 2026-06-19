@@ -646,9 +646,7 @@ static inline void debugfs_init(struct cfv_info *cfv)
 /* Setup CAIF for the a virtio device */
 static int cfv_probe(struct virtio_device *vdev)
 {
-	vq_callback_t *vq_cbs = cfv_release_cb;
 	vrh_callback_t *vrh_cbs = cfv_recv;
-	const char *names =  "output";
 	const char *cfv_netdev_name = "cfvrt";
 	struct net_device *netdev;
 	struct cfv_info *cfv;
@@ -675,9 +673,11 @@ static int cfv_probe(struct virtio_device *vdev)
 		goto err;
 
 	/* Get the TX virtio ring. This is a "guest side vring". */
-	err = virtio_find_vqs(vdev, 1, &cfv->vq_tx, &vq_cbs, &names, NULL);
-	if (err)
+	cfv->vq_tx = virtio_find_single_vq(vdev, cfv_release_cb, "output");
+	if (IS_ERR(cfv->vq_tx)) {
+		err = PTR_ERR(cfv->vq_tx);
 		goto err;
+	}
 
 	/* Get the CAIF configuration from virtio config space, if available */
 	if (vdev->config->get) {
@@ -714,7 +714,8 @@ static int cfv_probe(struct virtio_device *vdev)
 	/* Initialize NAPI poll context data */
 	vringh_kiov_init(&cfv->ctx.riov, NULL, 0);
 	cfv->ctx.head = USHRT_MAX;
-	netif_napi_add(netdev, &cfv->napi, cfv_rx_poll, CFV_DEFAULT_QUOTA);
+	netif_napi_add_weight(netdev, &cfv->napi, cfv_rx_poll,
+			      CFV_DEFAULT_QUOTA);
 
 	tasklet_setup(&cfv->tx_release_tasklet, cfv_tx_release_tasklet);
 
@@ -762,7 +763,7 @@ static void cfv_remove(struct virtio_device *vdev)
 	debugfs_remove_recursive(cfv->debugfs);
 
 	vringh_kiov_cleanup(&cfv->ctx.riov);
-	vdev->config->reset(vdev);
+	virtio_reset_device(vdev);
 	vdev->vringh_config->del_vrhs(cfv->vdev);
 	cfv->vr_rx = NULL;
 	vdev->config->del_vqs(cfv->vdev);
@@ -781,7 +782,6 @@ static struct virtio_driver caif_virtio_driver = {
 	.feature_table		= features,
 	.feature_table_size	= ARRAY_SIZE(features),
 	.driver.name		= KBUILD_MODNAME,
-	.driver.owner		= THIS_MODULE,
 	.id_table		= id_table,
 	.probe			= cfv_probe,
 	.remove			= cfv_remove,

@@ -20,9 +20,12 @@
 #include <linux/mod_devicetable.h>
 #include <linux/dma-mapping.h>
 #include <linux/of.h>
+#include <linux/of_dma.h>
 #include <linux/slab.h>
 
 #include "sf-pdma.h"
+
+#define PDMA_QUIRK_NO_STRICT_ORDERING   BIT(0)
 
 #ifndef readq
 static inline unsigned long long readq(void __iomem *addr)
@@ -65,7 +68,7 @@ static struct sf_pdma_desc *sf_pdma_alloc_desc(struct sf_pdma_chan *chan)
 static void sf_pdma_fill_desc(struct sf_pdma_desc *desc,
 			      u64 dst, u64 src, u64 size)
 {
-	desc->xfer_type = PDMA_FULL_SPEED;
+	desc->xfer_type =  desc->chan->pdma->transfer_type;
 	desc->xfer_size = size;
 	desc->dst_addr = dst;
 	desc->src_addr = src;
@@ -351,7 +354,7 @@ static irqreturn_t sf_pdma_done_isr(int irq, void *dev_id)
 	if (!residue) {
 		tasklet_hi_schedule(&chan->done_tasklet);
 	} else {
-		/* submit next trascatioin if possible */
+		/* submit next transaction if possible */
 		struct sf_pdma_desc *desc = chan->desc;
 
 		desc->src_addr += desc->xfer_size - residue;
@@ -404,10 +407,8 @@ static int sf_pdma_irq_init(struct platform_device *pdev, struct sf_pdma *pdma)
 		chan = &pdma->chans[i];
 
 		irq = platform_get_irq(pdev, i * 2);
-		if (irq < 0) {
-			dev_err(&pdev->dev, "ch(%d) Can't get done irq.\n", i);
+		if (irq < 0)
 			return -EINVAL;
-		}
 
 		r = devm_request_irq(&pdev->dev, irq, sf_pdma_done_isr, 0,
 				     dev_name(&pdev->dev), (void *)chan);
@@ -419,10 +420,8 @@ static int sf_pdma_irq_init(struct platform_device *pdev, struct sf_pdma *pdma)
 		chan->txirq = irq;
 
 		irq = platform_get_irq(pdev, (i * 2) + 1);
-		if (irq < 0) {
-			dev_err(&pdev->dev, "ch(%d) Can't get err irq.\n", i);
+		if (irq < 0)
 			return -EINVAL;
-		}
 
 		r = devm_request_irq(&pdev->dev, irq, sf_pdma_err_isr, 0,
 				     dev_name(&pdev->dev), (void *)chan);
@@ -496,27 +495,41 @@ static void sf_pdma_setup_chans(struct sf_pdma *pdma)
 
 static int sf_pdma_probe(struct platform_device *pdev)
 {
+	const struct sf_pdma_driver_platdata *ddata;
 	struct sf_pdma *pdma;
-	struct sf_pdma_chan *chan;
-	struct resource *res;
-	int len, chans;
-	int ret;
+	int ret, n_chans;
 	const enum dma_slave_buswidth widths =
 		DMA_SLAVE_BUSWIDTH_1_BYTE | DMA_SLAVE_BUSWIDTH_2_BYTES |
 		DMA_SLAVE_BUSWIDTH_4_BYTES | DMA_SLAVE_BUSWIDTH_8_BYTES |
 		DMA_SLAVE_BUSWIDTH_16_BYTES | DMA_SLAVE_BUSWIDTH_32_BYTES |
 		DMA_SLAVE_BUSWIDTH_64_BYTES;
 
-	chans = PDMA_NR_CH;
-	len = sizeof(*pdma) + sizeof(*chan) * chans;
-	pdma = devm_kzalloc(&pdev->dev, len, GFP_KERNEL);
+	ret = of_property_read_u32(pdev->dev.of_node, "dma-channels", &n_chans);
+	if (ret) {
+		/* backwards-compatibility for no dma-channels property */
+		dev_dbg(&pdev->dev, "set number of channels to default value: 4\n");
+		n_chans = PDMA_MAX_NR_CH;
+	} else if (n_chans > PDMA_MAX_NR_CH) {
+		dev_err(&pdev->dev, "the number of channels exceeds the maximum\n");
+		return -EINVAL;
+	}
+
+	pdma = devm_kzalloc(&pdev->dev, struct_size(pdma, chans, n_chans),
+			    GFP_KERNEL);
 	if (!pdma)
 		return -ENOMEM;
 
-	pdma->n_chans = chans;
+	pdma->n_chans = n_chans;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	pdma->membase = devm_ioremap_resource(&pdev->dev, res);
+	pdma->transfer_type = PDMA_FULL_SPEED | PDMA_STRICT_ORDERING;
+
+	ddata  = device_get_match_data(&pdev->dev);
+	if (ddata) {
+		if (ddata->quirks & PDMA_QUIRK_NO_STRICT_ORDERING)
+			pdma->transfer_type &= ~PDMA_STRICT_ORDERING;
+	}
+
+	pdma->membase = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(pdma->membase))
 		return PTR_ERR(pdma->membase);
 
@@ -562,16 +575,29 @@ static int sf_pdma_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	ret = of_dma_controller_register(pdev->dev.of_node,
+					 of_dma_xlate_by_chan_id, pdma);
+	if (ret < 0) {
+		dev_err(&pdev->dev,
+			"Can't register SiFive Platform OF_DMA. (%d)\n", ret);
+		goto err_unregister;
+	}
+
 	return 0;
+
+err_unregister:
+	dma_async_device_unregister(&pdma->dma_dev);
+
+	return ret;
 }
 
-static int sf_pdma_remove(struct platform_device *pdev)
+static void sf_pdma_remove(struct platform_device *pdev)
 {
 	struct sf_pdma *pdma = platform_get_drvdata(pdev);
 	struct sf_pdma_chan *ch;
 	int i;
 
-	for (i = 0; i < PDMA_NR_CH; i++) {
+	for (i = 0; i < pdma->n_chans; i++) {
 		ch = &pdma->chans[i];
 
 		devm_free_irq(&pdev->dev, ch->txirq, ch);
@@ -582,13 +608,25 @@ static int sf_pdma_remove(struct platform_device *pdev)
 		tasklet_kill(&ch->err_tasklet);
 	}
 
-	dma_async_device_unregister(&pdma->dma_dev);
+	if (pdev->dev.of_node)
+		of_dma_controller_free(pdev->dev.of_node);
 
-	return 0;
+	dma_async_device_unregister(&pdma->dma_dev);
 }
 
+static const struct sf_pdma_driver_platdata mpfs_pdma = {
+	.quirks = PDMA_QUIRK_NO_STRICT_ORDERING,
+};
+
 static const struct of_device_id sf_pdma_dt_ids[] = {
-	{ .compatible = "sifive,fu540-c000-pdma" },
+	{
+		.compatible = "sifive,fu540-c000-pdma",
+	}, {
+		.compatible = "sifive,pdma0",
+	}, {
+		.compatible = "microchip,mpfs-pdma",
+		.data	    = &mpfs_pdma,
+	},
 	{},
 };
 MODULE_DEVICE_TABLE(of, sf_pdma_dt_ids);

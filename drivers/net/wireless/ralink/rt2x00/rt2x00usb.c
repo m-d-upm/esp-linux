@@ -586,10 +586,10 @@ static void rt2x00usb_assign_endpoint(struct data_queue *queue,
 
 	if (queue->qid == QID_RX) {
 		pipe = usb_rcvbulkpipe(usb_dev, queue->usb_endpoint);
-		queue->usb_maxpacket = usb_maxpacket(usb_dev, pipe, 0);
+		queue->usb_maxpacket = usb_maxpacket(usb_dev, pipe);
 	} else {
 		pipe = usb_sndbulkpipe(usb_dev, queue->usb_endpoint);
-		queue->usb_maxpacket = usb_maxpacket(usb_dev, pipe, 1);
+		queue->usb_maxpacket = usb_maxpacket(usb_dev, pipe);
 	}
 
 	if (!queue->usb_maxpacket)
@@ -823,14 +823,12 @@ int rt2x00usb_probe(struct usb_interface *usb_intf,
 
 	INIT_WORK(&rt2x00dev->rxdone_work, rt2x00usb_work_rxdone);
 	INIT_WORK(&rt2x00dev->txdone_work, rt2x00usb_work_txdone);
-	hrtimer_init(&rt2x00dev->txstatus_timer, CLOCK_MONOTONIC,
-		     HRTIMER_MODE_REL);
 
 	retval = rt2x00usb_alloc_reg(rt2x00dev);
 	if (retval)
 		goto exit_free_device;
 
-	rt2x00dev->anchor = devm_kmalloc(&usb_dev->dev,
+	rt2x00dev->anchor = devm_kmalloc(&usb_intf->dev,
 					sizeof(struct usb_anchor),
 					GFP_KERNEL);
 	if (!rt2x00dev->anchor) {

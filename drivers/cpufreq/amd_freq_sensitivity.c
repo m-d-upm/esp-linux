@@ -91,7 +91,8 @@ static unsigned int amd_powersave_bias_target(struct cpufreq_policy *policy,
 			unsigned int index;
 
 			index = cpufreq_table_find_index_h(policy,
-							   policy->cur - 1);
+							   policy->cur - 1,
+							   relation & CPUFREQ_RELATION_E);
 			freq_next = policy->freq_table[index].frequency;
 		}
 
@@ -128,7 +129,7 @@ static int __init amd_freq_sensitivity_init(void)
 		pci_dev_put(pcidev);
 	}
 
-	if (rdmsrl_safe(MSR_AMD64_FREQ_SENSITIVITY_ACTUAL, &val))
+	if (rdmsrq_safe(MSR_AMD64_FREQ_SENSITIVITY_ACTUAL, &val))
 		return -ENODEV;
 
 	if (!(val >> CLASS_CODE_SHIFT))

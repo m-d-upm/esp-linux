@@ -705,6 +705,7 @@ static int ti_pipe3_get_sysctrl(struct ti_pipe3 *phy)
 		}
 
 		control_pdev = of_find_device_by_node(control_node);
+		of_node_put(control_node);
 		if (!control_pdev) {
 			dev_err(dev, "Failed to get control device\n");
 			return -EINVAL;
@@ -847,7 +848,7 @@ static int ti_pipe3_probe(struct platform_device *pdev)
 	return PTR_ERR_OR_ZERO(phy_provider);
 }
 
-static int ti_pipe3_remove(struct platform_device *pdev)
+static void ti_pipe3_remove(struct platform_device *pdev)
 {
 	struct ti_pipe3 *phy = platform_get_drvdata(pdev);
 
@@ -856,8 +857,6 @@ static int ti_pipe3_remove(struct platform_device *pdev)
 		phy->sata_refclk_enabled = false;
 	}
 	pm_runtime_disable(&pdev->dev);
-
-	return 0;
 }
 
 static int ti_pipe3_enable_clocks(struct ti_pipe3 *phy)
@@ -943,7 +942,6 @@ static struct platform_driver ti_pipe3_driver = {
 
 module_platform_driver(ti_pipe3_driver);
 
-MODULE_ALIAS("platform:ti_pipe3");
 MODULE_AUTHOR("Texas Instruments Inc.");
 MODULE_DESCRIPTION("TI PIPE3 phy driver");
 MODULE_LICENSE("GPL v2");

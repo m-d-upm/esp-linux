@@ -134,7 +134,8 @@ void sctp_packet_config(struct sctp_packet *packet, __u32 vtag,
 		dst_hold(tp->dst);
 		sk_setup_caps(sk, tp->dst);
 	}
-	packet->max_size = sk_can_gso(sk) ? tp->dst->dev->gso_max_size
+	packet->max_size = sk_can_gso(sk) ? min(READ_ONCE(tp->dst->dev->gso_max_size),
+						GSO_LEGACY_MAX_SIZE)
 					  : asoc->pathmtu;
 	rcu_read_unlock();
 }
@@ -311,7 +312,7 @@ static enum sctp_xmit sctp_packet_bundle_sack(struct sctp_packet *pkt,
 					       SCTP_MIB_OUTCTRLCHUNKS);
 				asoc->stats.octrlchunks++;
 				asoc->peer.sack_needed = 0;
-				if (del_timer(timer))
+				if (timer_delete(timer))
 					sctp_association_put(asoc);
 			}
 		}

@@ -29,15 +29,12 @@
 #include <linux/io.h>
 #include <linux/crc32.h>
 #include <linux/mii.h>
-#include <linux/of_device.h>
+#include <linux/of.h>
 #include <linux/of_net.h>
-#include <linux/of_platform.h>
+#include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <asm/cacheflush.h>
 #include <asm/byteorder.h>
-
-#include <linux/of_irq.h>
-#include <linux/of_reserved_mem.h>
 
 #ifdef CONFIG_SPARC
 #include <asm/idprom.h>
@@ -81,8 +78,8 @@ static int greth_close(struct net_device *dev);
 static int greth_set_mac_add(struct net_device *dev, void *p);
 static void greth_set_multicast_list(struct net_device *dev);
 
-#define GRETH_REGLOAD(a)	    	(__raw_readl(&(a)))
-#define GRETH_REGSAVE(a, v)         (__raw_writel(v, &(a)))
+#define GRETH_REGLOAD(a)	    (be32_to_cpu(__raw_readl(&(a))))
+#define GRETH_REGSAVE(a, v)         (__raw_writel(cpu_to_be32(v), &(a)))
 #define GRETH_REGORIN(a, v)         (GRETH_REGSAVE(a, (GRETH_REGLOAD(a) | (v))))
 #define GRETH_REGANDIN(a, v)        (GRETH_REGSAVE(a, (GRETH_REGLOAD(a) & (v))))
 
@@ -157,12 +154,12 @@ static inline void greth_disable_irqs(struct greth_private *greth)
 
 static inline void greth_write_bd(u32 *bd, u32 val)
 {
-	__raw_writel(val, bd);
+	__raw_writel(cpu_to_be32(val), bd);
 }
 
 static inline u32 greth_read_bd(u32 *bd)
 {
-	return __raw_readl(bd);
+	return be32_to_cpu(__raw_readl(bd));
 }
 
 static void greth_clean_rings(struct greth_private *greth)
@@ -215,17 +212,6 @@ static void greth_clean_rings(struct greth_private *greth)
 
 	} else { /* 10/100 Mbps MAC */
 
-		for (i = 0; i < GRETH_RXBD_NUM; i++, rx_bdp++)
-			dma_free_coherent(greth->dev, MAX_FRAME_SIZE,
-					greth->rx_bufs[i],
-					greth_read_bd(&rx_bdp->addr));
-
-		for (i = 0; i < GRETH_TXBD_NUM; i++, tx_bdp++)
-			dma_free_coherent(greth->dev, MAX_FRAME_SIZE,
-					greth->tx_bufs[i],
-					greth_read_bd(&tx_bdp->addr));
-
-		/*
 		for (i = 0; i < GRETH_RXBD_NUM; i++, rx_bdp++) {
 			kfree(greth->rx_bufs[i]);
 			dma_unmap_single(greth->dev,
@@ -240,7 +226,6 @@ static void greth_clean_rings(struct greth_private *greth)
 					 MAX_FRAME_SIZE,
 					 DMA_TO_DEVICE);
 		}
-		*/
 	}
 }
 
@@ -248,7 +233,7 @@ static int greth_init_rings(struct greth_private *greth)
 {
 	struct sk_buff *skb;
 	struct greth_bd *rx_bd, *tx_bd;
-	dma_addr_t dma_addr;
+	u32 dma_addr;
 	int i;
 
 	rx_bd = greth->rx_bd_base;
@@ -286,18 +271,14 @@ static int greth_init_rings(struct greth_private *greth)
 		/* 10/100 MAC uses a fixed set of buffers and copy to/from SKBs */
 		for (i = 0; i < GRETH_RXBD_NUM; i++) {
 
-			//greth->rx_bufs[i] = kmalloc(MAX_FRAME_SIZE, GFP_KERNEL);
-
-			greth->rx_bufs[i] = dma_alloc_coherent(greth->dev, MAX_FRAME_SIZE,
-							(dma_addr_t *) &dma_addr,
-							GFP_KERNEL);
+			greth->rx_bufs[i] = kmalloc(MAX_FRAME_SIZE, GFP_KERNEL);
 
 			if (greth->rx_bufs[i] == NULL) {
 				if (netif_msg_ifup(greth))
 					dev_err(greth->dev, "Error allocating DMA ring.\n");
 				goto cleanup;
 			}
-			/*
+
 			dma_addr = dma_map_single(greth->dev,
 						  greth->rx_bufs[i],
 						  MAX_FRAME_SIZE,
@@ -308,17 +289,12 @@ static int greth_init_rings(struct greth_private *greth)
 					dev_err(greth->dev, "Could not create initial DMA mapping\n");
 				goto cleanup;
 			}
-			*/
 			greth_write_bd(&rx_bd[i].addr, dma_addr);
 			greth_write_bd(&rx_bd[i].stat, GRETH_BD_EN | GRETH_BD_IE);
 		}
 		for (i = 0; i < GRETH_TXBD_NUM; i++) {
 
-			//greth->tx_bufs[i] = kmalloc(MAX_FRAME_SIZE, GFP_KERNEL);
-
-			greth->tx_bufs[i] = dma_alloc_coherent(greth->dev, MAX_FRAME_SIZE,
-							(dma_addr_t *) &dma_addr,
-							GFP_KERNEL);
+			greth->tx_bufs[i] = kmalloc(MAX_FRAME_SIZE, GFP_KERNEL);
 
 			if (greth->tx_bufs[i] == NULL) {
 				if (netif_msg_ifup(greth))
@@ -326,7 +302,6 @@ static int greth_init_rings(struct greth_private *greth)
 				goto cleanup;
 			}
 
-			/*
 			dma_addr = dma_map_single(greth->dev,
 						  greth->tx_bufs[i],
 						  MAX_FRAME_SIZE,
@@ -337,7 +312,6 @@ static int greth_init_rings(struct greth_private *greth)
 					dev_err(greth->dev, "Could not create initial DMA mapping\n");
 				goto cleanup;
 			}
-			*/
 			greth_write_bd(&tx_bd[i].addr, dma_addr);
 			greth_write_bd(&tx_bd[i].stat, 0);
 		}
@@ -422,17 +396,8 @@ greth_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	struct greth_private *greth = netdev_priv(dev);
 	struct greth_bd *bdp;
 	int err = NETDEV_TX_OK;
-	//u32 status, dma_addr, ctrl;
-	u32 status, ctrl;
-	dma_addr_t dma_addr;
+	u32 status, dma_addr, ctrl;
 	unsigned long flags;
-
-	int i, j;
-	int len;
-	int len_rest;
-
-	unsigned char* dma_dst;
-	unsigned char* dma_src;
 
 	/* Clean TX Ring */
 	greth_clean_tx(greth->netdev);
@@ -460,30 +425,8 @@ greth_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	bdp = greth->tx_bd_base + greth->tx_next;
 	dma_addr = greth_read_bd(&bdp->addr);
 
-	//memcpy((unsigned char *) phys_to_virt(dma_addr), skb->data, skb->len);
-	//memcpy(greth->tx_bufs[greth->tx_next], skb->data, skb->len);
-	
-	/* Workaround to fix little vs. big endian */
-	dma_dst = (unsigned char *) greth->tx_bufs[greth->tx_next];
-	dma_src = (unsigned char *) skb->data;
+	memcpy((unsigned char *) phys_to_virt(dma_addr), skb->data, skb->len);
 
-	//pr_info("greth_start_xmit skb->len = %d bytes\n", skb->len);
-
-	len = skb->len >> 2;
-	len_rest = skb->len - (len << 2);
-
-	for (i = 0; i < len; i++)
-		for (j = 0; j < 4; j++)
-			dma_dst[(i << 2) + j] = dma_src[(i << 2) + 3 - j];
-
-	if(len_rest > 0) {
-		for (j = 0; j < 4; j++)
-			if(j < len_rest)
-				dma_dst[(len << 2) + 3 - j] = dma_src[(len << 2) + j];
-			else
-				dma_dst[(len << 2) + 3 - j] = 0;
-	}
-		
 	dma_sync_single_for_device(greth->dev, dma_addr, skb->len, DMA_TO_DEVICE);
 
 	status = GRETH_BD_EN | GRETH_BD_IE | (skb->len & GRETH_BD_LEN);
@@ -521,9 +464,7 @@ greth_start_xmit_gbit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct greth_private *greth = netdev_priv(dev);
 	struct greth_bd *bdp;
-	//u32 status, dma_addr;
-	u32 status;
-	dma_addr_t dma_addr;
+	u32 status, dma_addr;
 	int curr_tx, nr_frags, i, err = NETDEV_TX_OK;
 	unsigned long flags;
 	u16 tx_last;
@@ -802,19 +743,8 @@ static int greth_rx(struct net_device *dev, int limit)
 	struct sk_buff *skb;
 	int pkt_len;
 	int bad, count;
-	//u32 status, dma_addr;
-	u32 status;
+	u32 status, dma_addr;
 	unsigned long flags;
-
-	dma_addr_t dma_addr;
-
-	int i, j;
-	int len;
-	int len_rest;
-
-	unsigned char *dma_dst;
-	unsigned char *dma_src;
-	void *tmp_skb_put;
 
 	greth = netdev_priv(dev);
 
@@ -871,43 +801,12 @@ static int greth_rx(struct net_device *dev, int limit)
 							pkt_len,
 							DMA_FROM_DEVICE);
 
-				//if (netif_msg_pktdata(greth))
-				//	greth_print_rx_packet(phys_to_virt(dma_addr), pkt_len);
-
 				if (netif_msg_pktdata(greth))
-					greth_print_rx_packet(greth->rx_bufs[greth->rx_cur], pkt_len);
+					greth_print_rx_packet(phys_to_virt(dma_addr), pkt_len);
 
-				//skb_put_data(skb, phys_to_virt(dma_addr),
-				//	     pkt_len);
+				skb_put_data(skb, phys_to_virt(dma_addr),
+					     pkt_len);
 
-				//skb_put_data(skb, greth->rx_bufs[greth->rx_cur],
-				//	     pkt_len);
-
-				/* Workaround to fix little vs. big endian */
-				tmp_skb_put = skb_put(skb, pkt_len);
-
-				dma_dst = (unsigned char*) tmp_skb_put;
-				dma_src = (unsigned char*) greth->rx_bufs[greth->rx_cur];
-
-				/*
-				for (i = 0; i < (pkt_len + 3) >> 2; i++)
-					for (j = 0; j < 4; j++)
-						dma_dst[(i << 2) + j] = dma_src[(i << 2) + 3 - j];	
-				*/
-
-				len = pkt_len >> 2;
-				len_rest = pkt_len - (len << 2);
-
-				for (i = 0; i < len; i++)
-					for (j = 0; j < 4; j++)
-						dma_dst[(i << 2) + j] = dma_src[(i << 2) + 3 - j];
-
-				if(len_rest > 0) {
-					for (j = 0; j < 4; j++)
-						if(j < len_rest)
-							dma_dst[(len << 2) + j] = dma_src[(len << 2) + 3 - j];
-				}
-			
 				skb->protocol = eth_type_trans(skb, dev);
 				dev->stats.rx_bytes += pkt_len;
 				dev->stats.rx_packets++;
@@ -1128,7 +1027,7 @@ static int greth_set_mac_add(struct net_device *dev, void *p)
 	if (!is_valid_ether_addr(addr->sa_data))
 		return -EADDRNOTAVAIL;
 
-	memcpy(dev->dev_addr, addr->sa_data, dev->addr_len);
+	eth_hw_addr_set(dev, addr->sa_data);
 	GRETH_REGSAVE(regs->esa_msb, dev->dev_addr[0] << 8 | dev->dev_addr[1]);
 	GRETH_REGSAVE(regs->esa_lsb, dev->dev_addr[2] << 24 | dev->dev_addr[3] << 16 |
 		      dev->dev_addr[4] << 8 | dev->dev_addr[5]);
@@ -1215,9 +1114,9 @@ static void greth_get_drvinfo(struct net_device *dev, struct ethtool_drvinfo *in
 {
 	struct greth_private *greth = netdev_priv(dev);
 
-	strlcpy(info->driver, dev_driver_string(greth->dev),
+	strscpy(info->driver, dev_driver_string(greth->dev),
 		sizeof(info->driver));
-	strlcpy(info->bus_info, greth->dev->bus->name, sizeof(info->bus_info));
+	strscpy(info->bus_info, greth->dev->bus->name, sizeof(info->bus_info));
 }
 
 static void greth_get_regs(struct net_device *dev, struct ethtool_regs *regs, void *p)
@@ -1252,7 +1151,7 @@ static struct net_device_ops greth_netdev_ops = {
 
 static inline int wait_for_mdio(struct greth_private *greth)
 {
-	unsigned long timeout = jiffies + msecs_to_jiffies(100);
+	unsigned long timeout = jiffies + 4*HZ/100;
 	while (GRETH_REGLOAD(greth->regs->mdio) & GRETH_MII_BUSY) {
 		if (time_after(jiffies, timeout))
 			return 0;
@@ -1422,9 +1321,7 @@ static int greth_mdio_init(struct greth_private *greth)
 	/* If Ethernet debug link is used make autoneg happen right away */
 	if (greth->edcl && greth_edcl == 1) {
 		phy_start_aneg(ndev->phydev);
-		//timeout = jiffies + 6*HZ;
-		timeout = jiffies + 100*HZ;
-
+		timeout = jiffies + 6*HZ;
 		while (!phy_aneg_done(ndev->phydev) &&
 		       time_before(jiffies, timeout)) {
 		}
@@ -1447,11 +1344,11 @@ static int greth_of_probe(struct platform_device *ofdev)
 	struct net_device *dev;
 	struct greth_private *greth;
 	struct greth_regs *regs;
-	struct resource *res;
 
 	int i;
 	int err;
 	int tmp;
+	u8 addr[ETH_ALEN];
 	unsigned long timeout;
 
 	dev = alloc_etherdev(sizeof(struct greth_private));
@@ -1470,10 +1367,9 @@ static int greth_of_probe(struct platform_device *ofdev)
 
 	spin_lock_init(&greth->devlock);
 
-	//greth->regs = devm_platform_ioremap_resource(ofdev, 0);
-
-	res = platform_get_resource(ofdev, IORESOURCE_MEM, 0);
-	greth->regs = devm_ioremap_resource(&ofdev->dev, res);
+	greth->regs = of_ioremap(&ofdev->resource[0], 0,
+				 resource_size(&ofdev->resource[0]),
+				 "grlib-greth regs");
 
 	if (greth->regs == NULL) {
 		if (netif_msg_probe(greth))
@@ -1483,13 +1379,7 @@ static int greth_of_probe(struct platform_device *ofdev)
 	}
 
 	regs = greth->regs;
-
-	//greth->irq = platform_get_irq(ofdev, 0);
-
-	greth->irq = of_irq_get(ofdev->dev.of_node, 0);
-
-	if (greth->irq < 0)
-		return greth->irq;
+	greth->irq = ofdev->archdata.irqs[0];
 
 	dev_set_drvdata(greth->dev, dev);
 	SET_NETDEV_DEV(dev, greth->dev);
@@ -1538,12 +1428,6 @@ static int greth_of_probe(struct platform_device *ofdev)
 		goto error2;
 	}
 
-	err = of_reserved_mem_device_init(greth->dev);
-	if(err)
-		dev_warn(greth->dev, "Could not get reserved memory\n");
-	else
-		dma_set_coherent_mask(greth->dev, 0xFFFFFFFF);
-
 	/* Allocate TX descriptor ring in coherent memory */
 	greth->tx_bd_base = dma_alloc_coherent(greth->dev, 1024,
 					       &greth->tx_bd_base_phys,
@@ -1568,8 +1452,6 @@ static int greth_of_probe(struct platform_device *ofdev)
 			break;
 	}
 	if (i == 6) {
-		u8 addr[ETH_ALEN];
-
 		err = of_get_mac_address(ofdev->dev.of_node, addr);
 		if (!err) {
 			for (i = 0; i < 6; i++)
@@ -1583,7 +1465,8 @@ static int greth_of_probe(struct platform_device *ofdev)
 	}
 
 	for (i = 0; i < 6; i++)
-		dev->dev_addr[i] = macaddr[i];
+		addr[i] = macaddr[i];
+	eth_hw_addr_set(dev, addr);
 
 	macaddr[5]++;
 
@@ -1626,7 +1509,7 @@ static int greth_of_probe(struct platform_device *ofdev)
 	}
 
 	/* setup NAPI */
-	netif_napi_add(dev, &greth->napi, greth_poll, 64);
+	netif_napi_add(dev, &greth->napi, greth_poll);
 
 	return 0;
 
@@ -1637,12 +1520,13 @@ error4:
 error3:
 	mdiobus_unregister(greth->mdio);
 error2:
+	of_iounmap(&ofdev->resource[0], greth->regs, resource_size(&ofdev->resource[0]));
 error1:
 	free_netdev(dev);
 	return err;
 }
 
-static int greth_of_remove(struct platform_device *of_dev)
+static void greth_of_remove(struct platform_device *of_dev)
 {
 	struct net_device *ndev = platform_get_drvdata(of_dev);
 	struct greth_private *greth = netdev_priv(ndev);
@@ -1658,9 +1542,9 @@ static int greth_of_remove(struct platform_device *of_dev)
 
 	unregister_netdev(ndev);
 
-	free_netdev(ndev);
+	of_iounmap(&of_dev->resource[0], greth->regs, resource_size(&of_dev->resource[0]));
 
-	return 0;
+	free_netdev(ndev);
 }
 
 static const struct of_device_id greth_of_match[] = {
@@ -1670,9 +1554,6 @@ static const struct of_device_id greth_of_match[] = {
 	{
 	 .name = "01_01d",
 	 },
-	{
-	 .compatible = "gaisler,ethmac",
-	},
 	{},
 };
 

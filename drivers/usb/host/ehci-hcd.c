@@ -32,7 +32,7 @@
 #include <asm/byteorder.h>
 #include <asm/io.h>
 #include <asm/irq.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #if defined(CONFIG_PPC_PS3)
 #include <asm/firmware.h>
@@ -466,8 +466,7 @@ static int ehci_init(struct usb_hcd *hcd)
 	 */
 	ehci->need_io_watchdog = 1;
 
-	hrtimer_init(&ehci->hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
-	ehci->hrtimer.function = ehci_hrtimer_func;
+	hrtimer_setup(&ehci->hrtimer, ehci_hrtimer_func, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
 	ehci->next_hrtimer_event = EHCI_HRTIMER_NO_EVENT;
 
 	hcc_params = ehci_readl(ehci, &ehci->caps->hcc_params);
@@ -547,7 +546,7 @@ static int ehci_init(struct usb_hcd *hcd)
 		 * make problems:  throughput reduction (!), data errors...
 		 */
 		if (park) {
-			park = min(park, (unsigned) 3);
+			park = min_t(unsigned int, park, 3);
 			temp |= CMD_PARK;
 			temp |= park << 8;
 		}
@@ -588,7 +587,7 @@ static int ehci_run (struct usb_hcd *hcd)
 	 * hcc_params controls whether ehci->regs->segment must (!!!)
 	 * be used; it constrains QH/ITD/SITD and QTD locations.
 	 * dma_pool consistent memory always uses segment zero.
-	 * streaming mappings for I/O buffers, like pci_map_single(),
+	 * streaming mappings for I/O buffers, like dma_map_single(),
 	 * can return segments above 4GB, if the device allows.
 	 *
 	 * NOTE:  the dma mask is visible through dev->dma_mask, so
@@ -1107,6 +1106,26 @@ static void ehci_remove_device(struct usb_hcd *hcd, struct usb_device *udev)
 
 #ifdef	CONFIG_PM
 
+/* Clear wakeup signal locked in zhaoxin platform when device plug in. */
+static void ehci_zx_wakeup_clear(struct ehci_hcd *ehci)
+{
+	u32 __iomem	*reg = &ehci->regs->port_status[4];
+	u32 		t1 = ehci_readl(ehci, reg);
+
+	t1 &= (u32)~0xf0000;
+	t1 |= PORT_TEST_FORCE;
+	ehci_writel(ehci, t1, reg);
+	t1 = ehci_readl(ehci, reg);
+	msleep(1);
+	t1 &= (u32)~0xf0000;
+	ehci_writel(ehci, t1, reg);
+	ehci_readl(ehci, reg);
+	msleep(1);
+	t1 = ehci_readl(ehci, reg);
+	ehci_writel(ehci, t1 | PORT_CSC, reg);
+	ehci_readl(ehci, reg);
+}
+
 /* suspend/resume, section 4.3 */
 
 /* These routines handle the generic parts of controller suspend/resume */
@@ -1157,6 +1176,9 @@ int ehci_resume(struct usb_hcd *hcd, bool force_reset)
 
 	if (ehci->shutdown)
 		return 0;		/* Controller is dead */
+
+	if (ehci->zx_wakeup_clear_needed)
+		ehci_zx_wakeup_clear(ehci);
 
 	/*
 	 * If CF is still set and reset isn't forced
@@ -1332,7 +1354,6 @@ static int __init ehci_hcd_init(void)
 	if (usb_disabled())
 		return -ENODEV;
 
-	printk(KERN_INFO "%s: " DRIVER_DESC "\n", hcd_name);
 	set_bit(USB_EHCI_LOADED, &usb_hcds_loaded);
 	if (test_bit(USB_UHCI_LOADED, &usb_hcds_loaded) ||
 			test_bit(USB_OHCI_LOADED, &usb_hcds_loaded))

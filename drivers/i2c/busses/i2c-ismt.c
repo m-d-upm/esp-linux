@@ -146,8 +146,8 @@
 #define ISMT_SPGT_SPD_MASK	0xc0000000	/* SMBus Speed mask */
 #define ISMT_SPGT_SPD_80K	0x00		/* 80 kHz */
 #define ISMT_SPGT_SPD_100K	(0x1 << 30)	/* 100 kHz */
-#define ISMT_SPGT_SPD_400K	(0x2 << 30)	/* 400 kHz */
-#define ISMT_SPGT_SPD_1M	(0x3 << 30)	/* 1 MHz */
+#define ISMT_SPGT_SPD_400K	(0x2U << 30)	/* 400 kHz */
+#define ISMT_SPGT_SPD_1M	(0x3U << 30)	/* 1 MHz */
 
 
 /* MSI Control Register (MSICTL) bit definitions */
@@ -379,6 +379,15 @@ static int ismt_process_desc(const struct ismt_desc *desc,
 		return -ETIMEDOUT;
 
 	return -EIO;
+}
+
+/**
+ * ismt_kill_transaction() - kill current transaction
+ * @priv: iSMT private data
+ */
+static void ismt_kill_transaction(struct ismt_priv *priv)
+{
+	writel(ISMT_GCTRL_KILL, priv->smba + ISMT_GR_GCTRL);
 }
 
 /**
@@ -623,7 +632,7 @@ static int ismt_access(struct i2c_adapter *adap, u16 addr,
 		dma_unmap_single(dev, dma_addr, dma_size, dma_direction);
 
 	if (unlikely(!time_left)) {
-		dev_err(dev, "completion wait timed out\n");
+		ismt_kill_transaction(priv);
 		ret = -ETIMEDOUT;
 		goto out;
 	}
@@ -924,7 +933,7 @@ ismt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return err;
 	}
 
-	err = pci_request_region(pdev, SMBBAR, ismt_driver.name);
+	err = pcim_request_region(pdev, SMBBAR, ismt_driver.name);
 	if (err) {
 		dev_err(&pdev->dev,
 			"Failed to request SMBus region 0x%lx-0x%lx\n",
@@ -938,15 +947,10 @@ ismt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return -ENODEV;
 	}
 
-	if ((pci_set_dma_mask(pdev, DMA_BIT_MASK(64)) != 0) ||
-	    (pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(64)) != 0)) {
-		if ((pci_set_dma_mask(pdev, DMA_BIT_MASK(32)) != 0) ||
-		    (pci_set_consistent_dma_mask(pdev,
-						 DMA_BIT_MASK(32)) != 0)) {
-			dev_err(&pdev->dev, "pci_set_dma_mask fail %p\n",
-				pdev);
-			return -ENODEV;
-		}
+	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	if (err) {
+		dev_err(&pdev->dev, "dma_set_mask fail\n");
+		return -ENODEV;
 	}
 
 	err = ismt_dev_init(priv);

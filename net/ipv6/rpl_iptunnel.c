@@ -13,7 +13,7 @@
 #include <net/rpl.h>
 
 struct rpl_iptunnel_encap {
-	struct ipv6_rpl_sr_hdr srh[0];
+	DECLARE_FLEX_ARRAY(struct ipv6_rpl_sr_hdr, srh);
 };
 
 struct rpl_lwt {
@@ -235,11 +235,14 @@ static int rpl_output(struct net *net, struct sock *sk, struct sk_buff *skb)
 			goto drop;
 		}
 
-		local_bh_disable();
-		dst_cache_set_ip6(&rlwt->cache, dst, &fl6.saddr);
-		local_bh_enable();
+		/* cache only if we don't create a dst reference loop */
+		if (orig_dst->lwtstate != dst->lwtstate) {
+			local_bh_disable();
+			dst_cache_set_ip6(&rlwt->cache, dst, &fl6.saddr);
+			local_bh_enable();
+		}
 
-		err = skb_cow_head(skb, LL_RESERVED_SPACE(dst->dev));
+		err = skb_cow_head(skb, LL_RESERVED_SPACE(dst_dev(dst)));
 		if (unlikely(err))
 			goto drop;
 	}
@@ -282,11 +285,18 @@ static int rpl_input(struct sk_buff *skb)
 		goto drop;
 	}
 
-	skb_dst_drop(skb);
-
 	if (!dst) {
 		ip6_route_input(skb);
+
+		/* ip6_route_input() sets a NOREF dst; force a refcount on it
+		 * before caching or further use.
+		 */
+		skb_dst_force(skb);
 		dst = skb_dst(skb);
+		if (unlikely(!dst)) {
+			err = -ENETUNREACH;
+			goto drop;
+		}
 
 		/* cache only if we don't create a dst reference loop */
 		if (!dst->error && lwtst != dst->lwtstate) {
@@ -296,10 +306,11 @@ static int rpl_input(struct sk_buff *skb)
 			local_bh_enable();
 		}
 
-		err = skb_cow_head(skb, LL_RESERVED_SPACE(dst->dev));
+		err = skb_cow_head(skb, LL_RESERVED_SPACE(dst_dev(dst)));
 		if (unlikely(err))
 			goto drop;
 	} else {
+		skb_dst_drop(skb);
 		skb_dst_set(skb, dst);
 	}
 

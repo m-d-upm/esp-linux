@@ -15,6 +15,7 @@
 #include <linux/delay.h>
 #include <linux/log2.h>
 #include <linux/slab.h>
+#include <linux/string_choices.h>
 #include <linux/pci.h>
 #include <linux/irq.h>
 #include <linux/dmi.h>
@@ -82,7 +83,7 @@ int cdnsp_find_next_ext_cap(void __iomem *base, u32 start, int id)
 		offset = HCC_EXT_CAPS(val) << 2;
 		if (!offset)
 			return 0;
-	};
+	}
 
 	do {
 		val = readl(base + offset);
@@ -399,7 +400,7 @@ int cdnsp_ep_enqueue(struct cdnsp_ep *pep, struct cdnsp_request *preq)
 		ret = cdnsp_queue_bulk_tx(pdev, preq);
 		break;
 	case USB_ENDPOINT_XFER_ISOC:
-		ret = cdnsp_queue_isoc_tx_prepare(pdev, preq);
+		ret = cdnsp_queue_isoc_tx(pdev, preq);
 	}
 
 	if (ret)
@@ -1277,12 +1278,9 @@ static int cdnsp_run(struct cdnsp_device *pdev,
 		     enum usb_device_speed speed)
 {
 	u32 fs_speed = 0;
-	u64 temp_64;
 	u32 temp;
 	int ret;
 
-	temp_64 = cdnsp_read_64(&pdev->ir_set->erst_dequeue);
-	temp_64 &= ~ERST_PTR_MASK;
 	temp = readl(&pdev->ir_set->irq_control);
 	temp &= ~IMOD_INTERVAL_MASK;
 	temp |= ((IMOD_DEFAULT_INTERVAL / 250) & IMOD_INTERVAL_MASK);
@@ -1711,12 +1709,12 @@ static int cdnsp_gadget_init_endpoints(struct cdnsp_device *pdev)
 			"CTRL: %s, INT: %s, BULK: %s, ISOC %s, "
 			"SupDir IN: %s, OUT: %s\n",
 			pep->name, 1024,
-			(pep->endpoint.caps.type_control) ? "yes" : "no",
-			(pep->endpoint.caps.type_int) ? "yes" : "no",
-			(pep->endpoint.caps.type_bulk) ? "yes" : "no",
-			(pep->endpoint.caps.type_iso) ? "yes" : "no",
-			(pep->endpoint.caps.dir_in) ? "yes" : "no",
-			(pep->endpoint.caps.dir_out) ? "yes" : "no");
+			str_yes_no(pep->endpoint.caps.type_control),
+			str_yes_no(pep->endpoint.caps.type_int),
+			str_yes_no(pep->endpoint.caps.type_bulk),
+			str_yes_no(pep->endpoint.caps.type_iso),
+			str_yes_no(pep->endpoint.caps.dir_in),
+			str_yes_no(pep->endpoint.caps.dir_out));
 
 		INIT_LIST_HEAD(&pep->pending_list);
 	}
@@ -2028,7 +2026,7 @@ static int cdnsp_gadget_suspend(struct cdns *cdns, bool do_wakeup)
 	return 0;
 }
 
-static int cdnsp_gadget_resume(struct cdns *cdns, bool hibernated)
+static int cdnsp_gadget_resume(struct cdns *cdns, bool lost_power)
 {
 	struct cdnsp_device *pdev = cdns->gadget_dev;
 	enum usb_device_speed max_speed;

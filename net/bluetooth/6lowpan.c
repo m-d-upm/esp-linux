@@ -13,6 +13,7 @@
 #include <net/ipv6.h>
 #include <net/ip6_route.h>
 #include <net/addrconf.h>
+#include <net/netdev_lock.h>
 #include <net/pkt_sched.h>
 
 #include <net/bluetooth/bluetooth.h>
@@ -140,7 +141,7 @@ static inline struct lowpan_peer *peer_lookup_dst(struct lowpan_btle_dev *dev,
 						  struct in6_addr *daddr,
 						  struct sk_buff *skb)
 {
-	struct rt6_info *rt = (struct rt6_info *)skb_dst(skb);
+	struct rt6_info *rt = dst_rt6_info(skb_dst(skb));
 	int count = atomic_read(&dev->peer_count);
 	const struct in6_addr *nexthop;
 	struct lowpan_peer *peer;
@@ -247,7 +248,7 @@ static int give_skb_to_upper(struct sk_buff *skb, struct net_device *dev)
 	if (!skb_cp)
 		return NET_RX_DROP;
 
-	return netif_rx_ni(skb_cp);
+	return netif_rx(skb_cp);
 }
 
 static int iphc_decompress(struct sk_buff *skb, struct net_device *netdev,
@@ -449,9 +450,9 @@ static int send_pkt(struct l2cap_chan *chan, struct sk_buff *skb,
 	iv.iov_len = skb->len;
 
 	memset(&msg, 0, sizeof(msg));
-	iov_iter_kvec(&msg.msg_iter, WRITE, &iv, 1, skb->len);
+	iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, &iv, 1, skb->len);
 
-	err = l2cap_chan_send(chan, &msg, skb->len);
+	err = l2cap_chan_send(chan, &msg, skb->len, NULL);
 	if (err > 0) {
 		netdev->stats.tx_bytes += err;
 		netdev->stats.tx_packets++;
@@ -485,6 +486,8 @@ static int send_mcast_pkt(struct sk_buff *skb, struct net_device *netdev)
 			int ret;
 
 			local_skb = skb_clone(skb, GFP_ATOMIC);
+			if (!local_skb)
+				continue;
 
 			BT_DBG("xmit %s to %pMR type %u IP %pI6c chan %p",
 			       netdev->name,
@@ -580,7 +583,7 @@ static void netdev_setup(struct net_device *dev)
 	dev->needs_free_netdev	= true;
 }
 
-static struct device_type bt_type = {
+static const struct device_type bt_type = {
 	.name	= "bluetooth",
 };
 
@@ -649,7 +652,6 @@ static struct l2cap_chan *add_peer_chan(struct l2cap_chan *chan,
 		return NULL;
 
 	peer->chan = chan;
-	memset(&peer->peer_addr, 0, sizeof(struct in6_addr));
 
 	baswap((void *)peer->lladdr, &chan->dst);
 
@@ -671,6 +673,7 @@ static struct l2cap_chan *add_peer_chan(struct l2cap_chan *chan,
 static int setup_netdev(struct l2cap_chan *chan, struct lowpan_btle_dev **dev)
 {
 	struct net_device *netdev;
+	bdaddr_t addr;
 	int err;
 
 	netdev = alloc_netdev(LOWPAN_PRIV_SIZE(sizeof(struct lowpan_btle_dev)),
@@ -680,7 +683,8 @@ static int setup_netdev(struct l2cap_chan *chan, struct lowpan_btle_dev **dev)
 		return -ENOMEM;
 
 	netdev->addr_assign_type = NET_ADDR_PERM;
-	baswap((void *)netdev->dev_addr, &chan->src);
+	baswap(&addr, &chan->src);
+	__dev_addr_set(netdev, &addr, sizeof(addr));
 
 	netdev->netdev_ops = &netdev_ops;
 	SET_NETDEV_DEV(netdev, &chan->conn->hcon->hdev->dev);
@@ -904,7 +908,7 @@ static int bt_6lowpan_connect(bdaddr_t *addr, u8 dst_type)
 	chan->ops = &bt_6lowpan_chan_ops;
 
 	err = l2cap_chan_connect(chan, cpu_to_le16(L2CAP_PSM_IPSP), 0,
-				 addr, dst_type);
+				 addr, dst_type, L2CAP_CONN_TIMEOUT);
 
 	BT_DBG("chan %p err %d", chan, err);
 	if (err < 0)
@@ -925,7 +929,9 @@ static int bt_6lowpan_disconnect(struct l2cap_conn *conn, u8 dst_type)
 
 	BT_DBG("peer %p chan %p", peer, peer->chan);
 
+	l2cap_chan_lock(peer->chan);
 	l2cap_chan_close(peer->chan, ENOENT);
+	l2cap_chan_unlock(peer->chan);
 
 	return 0;
 }
@@ -1087,7 +1093,9 @@ static void do_enable_set(struct work_struct *work)
 
 	mutex_lock(&set_lock);
 	if (listen_chan) {
+		l2cap_chan_lock(listen_chan);
 		l2cap_chan_close(listen_chan, 0);
+		l2cap_chan_unlock(listen_chan);
 		l2cap_chan_put(listen_chan);
 	}
 
@@ -1146,7 +1154,9 @@ static ssize_t lowpan_control_write(struct file *fp,
 
 		mutex_lock(&set_lock);
 		if (listen_chan) {
+			l2cap_chan_lock(listen_chan);
 			l2cap_chan_close(listen_chan, 0);
+			l2cap_chan_unlock(listen_chan);
 			l2cap_chan_put(listen_chan);
 			listen_chan = NULL;
 		}
@@ -1308,7 +1318,9 @@ static void __exit bt_6lowpan_exit(void)
 	debugfs_remove(lowpan_control_debugfs);
 
 	if (listen_chan) {
+		l2cap_chan_lock(listen_chan);
 		l2cap_chan_close(listen_chan, 0);
+		l2cap_chan_unlock(listen_chan);
 		l2cap_chan_put(listen_chan);
 	}
 

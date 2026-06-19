@@ -179,10 +179,9 @@ qla2x00_dfs_tgt_port_database_show(struct seq_file *s, void *unused)
 	struct qla_hw_data *ha = vha->hw;
 	struct gid_list_info *gid_list;
 	dma_addr_t gid_list_dma;
-	fc_port_t fc_port;
 	char *id_iter;
 	int rc, i;
-	uint16_t entries, loop_id;
+	uint16_t entries;
 
 	seq_printf(s, "%s\n", vha->host_str);
 	gid_list = dma_alloc_coherent(&ha->pdev->dev,
@@ -205,18 +204,11 @@ qla2x00_dfs_tgt_port_database_show(struct seq_file *s, void *unused)
 	seq_puts(s, "Port Name	Port ID		Loop ID\n");
 
 	for (i = 0; i < entries; i++) {
-		struct gid_list_info *gid =
-			(struct gid_list_info *)id_iter;
-		loop_id = le16_to_cpu(gid->loop_id);
-		memset(&fc_port, 0, sizeof(fc_port_t));
+		struct gid_list_info *gid = (struct gid_list_info *)id_iter;
 
-		fc_port.loop_id = loop_id;
-
-		rc = qla24xx_gpdb_wait(vha, &fc_port, 0);
-		seq_printf(s, "%8phC  %02x%02x%02x  %d\n",
-			   fc_port.port_name, fc_port.d_id.b.domain,
-			   fc_port.d_id.b.area, fc_port.d_id.b.al_pa,
-			   fc_port.loop_id);
+		rc = qla24xx_print_fc_port_id(vha, s, le16_to_cpu(gid->loop_id));
+		if (rc != QLA_SUCCESS)
+			break;
 		id_iter += ha->gid_list_info_size;
 	}
 out_free_id_list:
@@ -587,13 +579,69 @@ qla_dfs_naqp_show(struct seq_file *s, void *unused)
 	return 0;
 }
 
-static int
-qla_dfs_naqp_open(struct inode *inode, struct file *file)
-{
-	struct scsi_qla_host *vha = inode->i_private;
+/*
+ * Helper macros for setting up debugfs entries.
+ * _name: The name of the debugfs entry
+ * _ctx_struct: The context that was passed when creating the debugfs file
+ *
+ * QLA_DFS_SETUP_RD could be used when there is only a show function.
+ * - show function take the name qla_dfs_<sysfs-name>_show
+ *
+ * QLA_DFS_SETUP_RW could be used when there are both show and write functions.
+ * - show function take the name  qla_dfs_<sysfs-name>_show
+ * - write function take the name qla_dfs_<sysfs-name>_write
+ *
+ * To have a new debugfs entry, do:
+ * 1. Create a "struct dentry *" in the appropriate structure in the format
+ * dfs_<sysfs-name>
+ * 2. Setup debugfs entries using QLA_DFS_SETUP_RD / QLA_DFS_SETUP_RW
+ * 3. Create debugfs file in qla2x00_dfs_setup() using QLA_DFS_CREATE_FILE
+ * or QLA_DFS_ROOT_CREATE_FILE
+ * 4. Remove debugfs file in qla2x00_dfs_remove() using QLA_DFS_REMOVE_FILE
+ * or QLA_DFS_ROOT_REMOVE_FILE
+ *
+ * Example for creating "TEST" sysfs file:
+ * 1. struct qla_hw_data { ... struct dentry *dfs_TEST; }
+ * 2. QLA_DFS_SETUP_RD(TEST);
+ * 3. In qla2x00_dfs_setup():
+ * QLA_DFS_CREATE_FILE(ha, TEST, 0600, ha->dfs_dir, vha);
+ * 4. In qla2x00_dfs_remove():
+ * QLA_DFS_REMOVE_FILE(ha, TEST);
+ */
+#define QLA_DFS_SETUP_RD(_name)	DEFINE_SHOW_ATTRIBUTE(qla_dfs_##_name)
 
-	return single_open(file, qla_dfs_naqp_show, vha);
-}
+#define QLA_DFS_SETUP_RW(_name)	DEFINE_SHOW_STORE_ATTRIBUTE(qla_dfs_##_name)
+
+#define QLA_DFS_ROOT_CREATE_FILE(_name, _perm, _ctx)			\
+	do {								\
+		if (!qla_dfs_##_name)					\
+			qla_dfs_##_name = debugfs_create_file(#_name,	\
+					_perm, qla2x00_dfs_root, _ctx,	\
+					&qla_dfs_##_name##_fops);	\
+	} while (0)
+
+#define QLA_DFS_ROOT_REMOVE_FILE(_name)					\
+	do {								\
+		if (qla_dfs_##_name) {					\
+			debugfs_remove(qla_dfs_##_name);		\
+			qla_dfs_##_name = NULL;				\
+		}							\
+	} while (0)
+
+#define QLA_DFS_CREATE_FILE(_struct, _name, _perm, _parent, _ctx)	\
+	do {								\
+		(_struct)->dfs_##_name = debugfs_create_file(#_name,	\
+					_perm, _parent, _ctx,		\
+					&qla_dfs_##_name##_fops)	\
+	} while (0)
+
+#define QLA_DFS_REMOVE_FILE(_struct, _name)				\
+	do {								\
+		if ((_struct)->dfs_##_name) {				\
+			debugfs_remove((_struct)->dfs_##_name);		\
+			(_struct)->dfs_##_name = NULL;			\
+		}							\
+	} while (0)
 
 static ssize_t
 qla_dfs_naqp_write(struct file *file, const char __user *buffer,
@@ -642,15 +690,7 @@ out_free:
 	kfree(buf);
 	return rc;
 }
-
-static const struct file_operations dfs_naqp_ops = {
-	.open		= qla_dfs_naqp_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-	.write		= qla_dfs_naqp_write,
-};
-
+QLA_DFS_SETUP_RW(naqp);
 
 int
 qla2x00_dfs_setup(scsi_qla_host_t *vha)
@@ -694,7 +734,7 @@ create_nodes:
 
 	if (IS_QLA27XX(ha) || IS_QLA83XX(ha) || IS_QLA28XX(ha)) {
 		ha->tgt.dfs_naqp = debugfs_create_file("naqp",
-		    0400, ha->dfs_dir, vha, &dfs_naqp_ops);
+		    0400, ha->dfs_dir, vha, &qla_dfs_naqp_fops);
 		if (IS_ERR(ha->tgt.dfs_naqp)) {
 			ql_log(ql_log_warn, vha, 0xd011,
 			       "Unable to create debugFS naqp node.\n");

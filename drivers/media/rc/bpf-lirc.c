@@ -110,7 +110,7 @@ lirc_mode2_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 	case BPF_FUNC_get_prandom_u32:
 		return &bpf_get_prandom_u32_proto;
 	case BPF_FUNC_trace_printk:
-		if (perfmon_capable())
+		if (bpf_token_capable(prog->aux->token, CAP_PERFMON))
 			return bpf_get_trace_printk_proto();
 		fallthrough;
 	default:
@@ -216,8 +216,12 @@ void lirc_bpf_run(struct rc_dev *rcdev, u32 sample)
 
 	raw->bpf_sample = sample;
 
-	if (raw->progs)
-		BPF_PROG_RUN_ARRAY(raw->progs, &raw->bpf_sample, bpf_prog_run);
+	if (raw->progs) {
+		rcu_read_lock();
+		bpf_prog_run_array(rcu_dereference(raw->progs),
+				   &raw->bpf_sample, bpf_prog_run);
+		rcu_read_unlock();
+	}
 }
 
 /*

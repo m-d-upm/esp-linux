@@ -12,7 +12,9 @@
 #include <sys/fanotify.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <sys/types.h>
+#ifndef __GLIBC__
+#include <asm-generic/int-ll64.h>
+#endif
 
 #ifndef FAN_FS_ERROR
 #define FAN_FS_ERROR		0x00008000
@@ -65,7 +67,8 @@ static void handle_notifications(char *buffer, int len)
 	for (; FAN_EVENT_OK(event, len); event = FAN_EVENT_NEXT(event, len)) {
 
 		if (event->mask != FAN_FS_ERROR) {
-			printf("unexpected FAN MARK: %llx\n", event->mask);
+			printf("unexpected FAN MARK: %llx\n",
+							(unsigned long long)event->mask);
 			goto next_event;
 		}
 
@@ -95,7 +98,11 @@ static void handle_notifications(char *buffer, int len)
 				fid = (struct fanotify_event_info_fid *) info;
 
 				printf("\tfsid: %x%x\n",
+#if defined(__GLIBC__)
 				       fid->fsid.val[0], fid->fsid.val[1]);
+#else
+				       fid->fsid.__val[0], fid->fsid.__val[1]);
+#endif
 				print_fh((struct file_handle *) &fid->handle);
 				break;
 

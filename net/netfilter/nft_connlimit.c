@@ -42,7 +42,7 @@ static inline void nft_connlimit_do_eval(struct nft_connlimit *priv,
 		}
 	}
 
-	count = priv->list->count;
+	count = READ_ONCE(priv->list->count);
 
 	if ((count > priv->limit) ^ priv->invert) {
 		regs->verdict.code = NFT_BREAK;
@@ -179,7 +179,8 @@ static void nft_connlimit_eval(const struct nft_expr *expr,
 	nft_connlimit_do_eval(priv, regs, pkt, NULL);
 }
 
-static int nft_connlimit_dump(struct sk_buff *skb, const struct nft_expr *expr)
+static int nft_connlimit_dump(struct sk_buff *skb,
+			      const struct nft_expr *expr, bool reset)
 {
 	struct nft_connlimit *priv = nft_expr_priv(expr);
 
@@ -231,13 +232,8 @@ static void nft_connlimit_destroy_clone(const struct nft_ctx *ctx,
 static bool nft_connlimit_gc(struct net *net, const struct nft_expr *expr)
 {
 	struct nft_connlimit *priv = nft_expr_priv(expr);
-	bool ret;
 
-	local_bh_disable();
-	ret = nf_conncount_gc_list(net, priv->list);
-	local_bh_enable();
-
-	return ret;
+	return nf_conncount_gc_list(net, priv->list);
 }
 
 static struct nft_expr_type nft_connlimit_type;
@@ -251,6 +247,7 @@ static const struct nft_expr_ops nft_connlimit_ops = {
 	.destroy_clone	= nft_connlimit_destroy_clone,
 	.dump		= nft_connlimit_dump,
 	.gc		= nft_connlimit_gc,
+	.reduce		= NFT_REDUCE_READONLY,
 };
 
 static struct nft_expr_type nft_connlimit_type __read_mostly = {

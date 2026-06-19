@@ -43,6 +43,7 @@
 #include "bearer.h"
 #include <net/sock.h>
 #include <linux/module.h>
+#include <trace/events/sock.h>
 
 /* Number of messages to send before rescheduling */
 #define MAX_SEND_MSG_COUNT	25
@@ -56,7 +57,7 @@
  * @conn_idr: identifier set of connection
  * @idr_lock: protect the connection identifier set
  * @idr_in_use: amount of allocated identifier entry
- * @net: network namspace instance
+ * @net: network namespace instance
  * @awork: accept work item
  * @rcv_wq: receive workqueue
  * @send_wq: send workqueue
@@ -82,7 +83,7 @@ struct tipc_topsrv {
  * @sock: socket handler associated with connection
  * @flags: indicates connection state
  * @server: pointer to connected server
- * @sub_list: lsit to all pertaing subscriptions
+ * @sub_list: list to all pertaining subscriptions
  * @sub_lock: lock protecting the subscription list
  * @rwork: receive work item
  * @outqueue: pointer to first outbound message in queue
@@ -396,7 +397,7 @@ static int tipc_conn_rcv_from_sock(struct tipc_conn *con)
 	iov.iov_base = &s;
 	iov.iov_len = sizeof(s);
 	msg.msg_name = NULL;
-	iov_iter_kvec(&msg.msg_iter, READ, &iov, 1, iov.iov_len);
+	iov_iter_kvec(&msg.msg_iter, ITER_DEST, &iov, 1, iov.iov_len);
 	ret = sock_recvmsg(con->sock, &msg, MSG_DONTWAIT);
 	if (ret == -EWOULDBLOCK)
 		return -EWOULDBLOCK;
@@ -438,6 +439,8 @@ static void tipc_conn_recv_work(struct work_struct *work)
 static void tipc_conn_data_ready(struct sock *sk)
 {
 	struct tipc_conn *con;
+
+	trace_sk_data_ready(sk);
 
 	read_lock_bh(&sk->sk_callback_lock);
 	con = sk->sk_user_data;
@@ -495,6 +498,8 @@ static void tipc_topsrv_accept(struct work_struct *work)
 static void tipc_topsrv_listener_data_ready(struct sock *sk)
 {
 	struct tipc_topsrv *srv;
+
+	trace_sk_data_ready(sk);
 
 	read_lock_bh(&sk->sk_callback_lock);
 	srv = sk->sk_user_data;

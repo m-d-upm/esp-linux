@@ -165,7 +165,7 @@ struct atmel_nand {
 	struct atmel_pmecc_user *pmecc;
 	struct gpio_desc *cdgpio;
 	int numcs;
-	struct atmel_nand_cs cs[];
+	struct atmel_nand_cs cs[] __counted_by(numcs);
 };
 
 static inline struct atmel_nand *to_atmel_nand(struct nand_chip *chip)
@@ -1240,7 +1240,7 @@ static int atmel_smc_nand_prepare_smcconf(struct atmel_nand *nand,
 					const struct nand_interface_config *conf,
 					struct atmel_smc_cs_conf *smcconf)
 {
-	u32 ncycles, totalcycles, timeps, mckperiodps;
+	u32 ncycles, totalcycles, timeps, mckperiodps, pulse;
 	struct atmel_nand_controller *nc;
 	int ret;
 
@@ -1366,11 +1366,16 @@ static int atmel_smc_nand_prepare_smcconf(struct atmel_nand *nand,
 			 ATMEL_SMC_MODE_TDFMODE_OPTIMIZED;
 
 	/*
-	 * Read pulse timing directly matches tRP:
+	 * Read pulse timing would directly match tRP,
+	 * but some NAND flash chips (S34ML01G2 and W29N02KVxxAF)
+	 * do not work properly in timing mode 3.
+	 * The workaround is to extend the SMC NRD pulse to meet tREA
+	 * timing.
 	 *
-	 * NRD_PULSE = tRP
+	 * NRD_PULSE = max(tRP, tREA)
 	 */
-	ncycles = DIV_ROUND_UP(conf->timings.sdr.tRP_min, mckperiodps);
+	pulse = max(conf->timings.sdr.tRP_min, conf->timings.sdr.tREA_max);
+	ncycles = DIV_ROUND_UP(pulse, mckperiodps);
 	totalcycles += ncycles;
 	ret = atmel_smc_cs_conf_set_pulse(smcconf, ATMEL_SMC_NRD_SHIFT,
 					  ncycles);
@@ -1801,8 +1806,7 @@ atmel_nand_controller_legacy_add_nands(struct atmel_nand_controller *nc)
 
 	nand->numcs = 1;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	nand->cs[0].io.virt = devm_ioremap_resource(dev, res);
+	nand->cs[0].io.virt = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(nand->cs[0].io.virt))
 		return PTR_ERR(nand->cs[0].io.virt);
 
@@ -1859,7 +1863,7 @@ atmel_nand_controller_legacy_add_nands(struct atmel_nand_controller *nc)
 
 static int atmel_nand_controller_add_nands(struct atmel_nand_controller *nc)
 {
-	struct device_node *np, *nand_np;
+	struct device_node *np;
 	struct device *dev = nc->dev;
 	int ret, reg_cells;
 	u32 val;
@@ -1886,7 +1890,7 @@ static int atmel_nand_controller_add_nands(struct atmel_nand_controller *nc)
 
 	reg_cells += val;
 
-	for_each_child_of_node(np, nand_np) {
+	for_each_child_of_node_scoped(np, nand_np) {
 		struct atmel_nand *nand;
 
 		nand = atmel_nand_create(nc, nand_np, reg_cells);
@@ -1949,7 +1953,7 @@ static const struct atmel_smc_nand_ebi_csa_cfg sam9x60_ebi_csa = {
 	.nfd0_on_d16 = AT91_SFR_CCFG_NFD0_ON_D16,
 };
 
-static const struct of_device_id atmel_ebi_csa_regmap_of_ids[] = {
+static const struct of_device_id __maybe_unused atmel_ebi_csa_regmap_of_ids[] = {
 	{
 		.compatible = "atmel,at91sam9260-matrix",
 		.data = &at91sam9260_ebi_csa,
@@ -2060,7 +2064,10 @@ static int atmel_nand_controller_init(struct atmel_nand_controller *nc,
 		dma_cap_set(DMA_MEMCPY, mask);
 
 		nc->dmac = dma_request_channel(mask, NULL, NULL);
-		if (!nc->dmac)
+		if (nc->dmac)
+			dev_info(nc->dev, "using %s for DMA transfers\n",
+				 dma_chan_name(nc->dmac));
+		else
 			dev_err(nc->dev, "Failed to request DMA channel\n");
 	}
 
@@ -2636,11 +2643,11 @@ static int atmel_nand_controller_probe(struct platform_device *pdev)
 	return caps->ops->probe(pdev, caps);
 }
 
-static int atmel_nand_controller_remove(struct platform_device *pdev)
+static void atmel_nand_controller_remove(struct platform_device *pdev)
 {
 	struct atmel_nand_controller *nc = platform_get_drvdata(pdev);
 
-	return nc->caps->ops->remove(nc);
+	WARN_ON(nc->caps->ops->remove(nc));
 }
 
 static __maybe_unused int atmel_nand_controller_resume(struct device *dev)
@@ -2667,7 +2674,7 @@ static SIMPLE_DEV_PM_OPS(atmel_nand_controller_pm_ops, NULL,
 static struct platform_driver atmel_nand_controller_driver = {
 	.driver = {
 		.name = "atmel-nand-controller",
-		.of_match_table = of_match_ptr(atmel_nand_controller_of_ids),
+		.of_match_table = atmel_nand_controller_of_ids,
 		.pm = &atmel_nand_controller_pm_ops,
 	},
 	.probe = atmel_nand_controller_probe,

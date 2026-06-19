@@ -17,7 +17,6 @@
 #include <asm/cputype.h>
 #include <asm/highmem.h>
 #include <asm/mach/map.h>
-#include <asm/memory.h>
 #include <asm/page.h>
 #include <asm/pgalloc.h>
 #include <asm/procinfo.h>
@@ -29,10 +28,16 @@ static pgd_t tmp_pgd_table[PTRS_PER_PGD] __initdata __aligned(PGD_SIZE);
 
 pmd_t tmp_pmd_table[PTRS_PER_PMD] __page_aligned_bss;
 
+static __init void *kasan_alloc_block_raw(size_t size)
+{
+	return memblock_alloc_try_nid_raw(size, size, __pa(MAX_DMA_ADDRESS),
+				      MEMBLOCK_ALLOC_NOLEAKTRACE, NUMA_NO_NODE);
+}
+
 static __init void *kasan_alloc_block(size_t size)
 {
 	return memblock_alloc_try_nid(size, size, __pa(MAX_DMA_ADDRESS),
-				      MEMBLOCK_ALLOC_KASAN, NUMA_NO_NODE);
+				      MEMBLOCK_ALLOC_NOLEAKTRACE, NUMA_NO_NODE);
 }
 
 static void __init kasan_pte_populate(pmd_t *pmdp, unsigned long addr,
@@ -51,7 +56,7 @@ static void __init kasan_pte_populate(pmd_t *pmdp, unsigned long addr,
 			if (!pte_none(READ_ONCE(*ptep)))
 				continue;
 
-			p = kasan_alloc_block(PAGE_SIZE);
+			p = kasan_alloc_block_raw(PAGE_SIZE);
 			if (!p) {
 				panic("%s failed to allocate shadow page for address 0x%lx\n",
 				      __func__, addr);
@@ -236,7 +241,11 @@ void __init kasan_init(void)
 
 	clear_pgds(KASAN_SHADOW_START, KASAN_SHADOW_END);
 
-	kasan_populate_early_shadow(kasan_mem_to_shadow((void *)VMALLOC_START),
+	if (!IS_ENABLED(CONFIG_KASAN_VMALLOC))
+		kasan_populate_early_shadow(kasan_mem_to_shadow((void *)VMALLOC_START),
+					    kasan_mem_to_shadow((void *)VMALLOC_END));
+
+	kasan_populate_early_shadow(kasan_mem_to_shadow((void *)VMALLOC_END),
 				    kasan_mem_to_shadow((void *)-1UL) + 1);
 
 	for_each_mem_range(i, &pa_start, &pa_end) {
@@ -291,6 +300,6 @@ void __init kasan_init(void)
 	local_flush_tlb_all();
 
 	memset(kasan_early_shadow_page, 0, PAGE_SIZE);
-	pr_info("Kernel address sanitizer initialized\n");
 	init_task.kasan_depth = 0;
+	kasan_init_generic();
 }

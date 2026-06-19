@@ -1274,7 +1274,7 @@ int komeda_release_unclaimed_resources(struct komeda_pipeline *pipe,
 
 }
 
-/* Since standalong disabled components must be disabled separately and in the
+/* Since standalone disabled components must be disabled separately and in the
  * last, So a complete disable operation may needs to call pipeline_disable
  * twice (two phase disabling).
  * Phase 1: disable the common components, flush it.

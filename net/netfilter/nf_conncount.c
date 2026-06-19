@@ -34,8 +34,9 @@
 
 #define CONNCOUNT_SLOTS		256U
 
-#define CONNCOUNT_GC_MAX_NODES	8
-#define MAX_KEYLEN		5
+#define CONNCOUNT_GC_MAX_NODES		8
+#define CONNCOUNT_GC_MAX_COLLECT	64
+#define MAX_KEYLEN			5
 
 /* we will save the tuples of all connections we care about */
 struct nf_conncount_tuple {
@@ -178,16 +179,28 @@ static int __nf_conncount_add(struct net *net,
 		return -ENOENT;
 
 	if (ct && nf_ct_is_confirmed(ct)) {
-		err = -EEXIST;
-		goto out_put;
+		/* local connections are confirmed in postrouting so confirmation
+		 * might have happened before hitting connlimit
+		 */
+		if (skb->skb_iif != LOOPBACK_IFINDEX) {
+			err = -EEXIST;
+			goto out_put;
+		}
+
+		/* this is likely a local connection, skip optimization to avoid
+		 * adding duplicates from a 'packet train'
+		 */
+		goto check_connections;
 	}
 
-	if ((u32)jiffies == list->last_gc)
+	if ((u32)jiffies == list->last_gc &&
+	    (list->count - list->last_gc_count) < CONNCOUNT_GC_MAX_COLLECT)
 		goto add_new_node;
 
+check_connections:
 	/* check the saved connections */
 	list_for_each_entry_safe(conn, conn_n, &list->head, node) {
-		if (collect > CONNCOUNT_GC_MAX_NODES)
+		if (collect > CONNCOUNT_GC_MAX_COLLECT)
 			break;
 
 		found = find_or_evict(net, list, conn);
@@ -230,6 +243,7 @@ static int __nf_conncount_add(struct net *net,
 		nf_ct_put(found_ct);
 	}
 	list->last_gc = (u32)jiffies;
+	list->last_gc_count = list->count;
 
 add_new_node:
 	if (WARN_ON_ONCE(list->count > INT_MAX)) {
@@ -277,13 +291,14 @@ void nf_conncount_list_init(struct nf_conncount_list *list)
 	spin_lock_init(&list->list_lock);
 	INIT_LIST_HEAD(&list->head);
 	list->count = 0;
+	list->last_gc_count = 0;
 	list->last_gc = (u32)jiffies;
 }
 EXPORT_SYMBOL_GPL(nf_conncount_list_init);
 
 /* Return true if the list is empty. Must be called with BH disabled. */
-bool nf_conncount_gc_list(struct net *net,
-			  struct nf_conncount_list *list)
+static bool __nf_conncount_gc_list(struct net *net,
+				   struct nf_conncount_list *list)
 {
 	const struct nf_conntrack_tuple_hash *found;
 	struct nf_conncount_tuple *conn, *conn_n;
@@ -293,10 +308,6 @@ bool nf_conncount_gc_list(struct net *net,
 
 	/* don't bother if we just did GC */
 	if ((u32)jiffies == READ_ONCE(list->last_gc))
-		return false;
-
-	/* don't bother if other cpu is already doing GC */
-	if (!spin_trylock(&list->list_lock))
 		return false;
 
 	list_for_each_entry_safe(conn, conn_n, &list->head, node) {
@@ -320,14 +331,29 @@ bool nf_conncount_gc_list(struct net *net,
 		}
 
 		nf_ct_put(found_ct);
-		if (collected > CONNCOUNT_GC_MAX_NODES)
+		if (collected > CONNCOUNT_GC_MAX_COLLECT)
 			break;
 	}
 
 	if (!list->count)
 		ret = true;
 	list->last_gc = (u32)jiffies;
-	spin_unlock(&list->list_lock);
+	list->last_gc_count = list->count;
+
+	return ret;
+}
+
+bool nf_conncount_gc_list(struct net *net,
+			  struct nf_conncount_list *list)
+{
+	bool ret;
+
+	/* don't bother if other cpu is already doing GC */
+	if (!spin_trylock_bh(&list->list_lock))
+		return false;
+
+	ret = __nf_conncount_gc_list(net, list);
+	spin_unlock_bh(&list->list_lock);
 
 	return ret;
 }
@@ -594,11 +620,10 @@ unsigned int nf_conncount_count_skb(struct net *net,
 }
 EXPORT_SYMBOL_GPL(nf_conncount_count_skb);
 
-struct nf_conncount_data *nf_conncount_init(struct net *net, unsigned int family,
-					    unsigned int keylen)
+struct nf_conncount_data *nf_conncount_init(struct net *net, unsigned int keylen)
 {
 	struct nf_conncount_data *data;
-	int ret, i;
+	int i;
 
 	if (keylen % sizeof(u32) ||
 	    keylen / sizeof(u32) > MAX_KEYLEN ||
@@ -610,12 +635,6 @@ struct nf_conncount_data *nf_conncount_init(struct net *net, unsigned int family
 	data = kmalloc(sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return ERR_PTR(-ENOMEM);
-
-	ret = nf_ct_netns_get(net, family);
-	if (ret < 0) {
-		kfree(data);
-		return ERR_PTR(ret);
-	}
 
 	for (i = 0; i < ARRAY_SIZE(data->root); ++i)
 		data->root[i] = RB_ROOT;
@@ -653,13 +672,11 @@ static void destroy_tree(struct rb_root *r)
 	}
 }
 
-void nf_conncount_destroy(struct net *net, unsigned int family,
-			  struct nf_conncount_data *data)
+void nf_conncount_destroy(struct net *net, struct nf_conncount_data *data)
 {
 	unsigned int i;
 
 	cancel_work_sync(&data->gc_work);
-	nf_ct_netns_put(net, family);
 
 	for (i = 0; i < ARRAY_SIZE(data->root); ++i)
 		destroy_tree(&data->root[i]);
@@ -675,15 +692,11 @@ static int __init nf_conncount_modinit(void)
 	for (i = 0; i < CONNCOUNT_SLOTS; ++i)
 		spin_lock_init(&nf_conncount_locks[i]);
 
-	conncount_conn_cachep = kmem_cache_create("nf_conncount_tuple",
-					   sizeof(struct nf_conncount_tuple),
-					   0, 0, NULL);
+	conncount_conn_cachep = KMEM_CACHE(nf_conncount_tuple, 0);
 	if (!conncount_conn_cachep)
 		return -ENOMEM;
 
-	conncount_rb_cachep = kmem_cache_create("nf_conncount_rb",
-					   sizeof(struct nf_conncount_rb),
-					   0, 0, NULL);
+	conncount_rb_cachep = KMEM_CACHE(nf_conncount_rb, 0);
 	if (!conncount_rb_cachep) {
 		kmem_cache_destroy(conncount_conn_cachep);
 		return -ENOMEM;

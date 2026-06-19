@@ -23,7 +23,6 @@
 #include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/rculist.h>
-#include <net/p8022.h>
 #include <net/arp.h>
 #include <linux/rtnetlink.h>
 #include <linux/notifier.h>
@@ -322,8 +321,7 @@ static void vlan_transfer_features(struct net_device *dev,
 {
 	struct vlan_dev_priv *vlan = vlan_dev_priv(vlandev);
 
-	vlandev->gso_max_size = dev->gso_max_size;
-	vlandev->gso_max_segs = dev->gso_max_segs;
+	netif_inherit_tso_max(vlandev, dev);
 
 	if (vlan_hw_offload_capable(dev->features, vlan->vlan_proto))
 		vlandev->hard_header_len = dev->hard_header_len;
@@ -474,7 +472,7 @@ static int vlan_device_event(struct notifier_block *unused, unsigned long event,
 				list_add(&vlandev->close_list, &close_list);
 		}
 
-		dev_close_many(&close_list, false);
+		netif_close_many(&close_list, false);
 
 		list_for_each_entry_safe(vlandev, tmp, &close_list, close_list) {
 			vlan_stacked_transfer_operstate(dev, vlandev,
@@ -487,7 +485,7 @@ static int vlan_device_event(struct notifier_block *unused, unsigned long event,
 	case NETDEV_UP:
 		/* Put all VLANs for this dev in the up state too.  */
 		vlan_group_for_each_dev(grp, i, vlandev) {
-			flgs = dev_get_flags(vlandev);
+			flgs = netif_get_flags(vlandev);
 			if (flgs & IFF_UP)
 				continue;
 
@@ -766,5 +764,7 @@ static void __exit vlan_cleanup_module(void)
 module_init(vlan_proto_init);
 module_exit(vlan_cleanup_module);
 
+MODULE_DESCRIPTION("802.1Q/802.1ad VLAN Protocol");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(DRV_VERSION);
+MODULE_IMPORT_NS("NETDEV_INTERNAL");

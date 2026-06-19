@@ -2652,10 +2652,10 @@ int bnx2x_get_vf_config(struct net_device *dev, int vfidx,
 		/* vlan */
 		if (bulletin->valid_bitmap & (1 << VLAN_VALID))
 			/* vlan configured by ndo so its in bulletin board */
-			memcpy(&ivi->vlan, &bulletin->vlan, VLAN_HLEN);
+			ivi->vlan = bulletin->vlan;
 		else
 			/* function has not been loaded yet. Show vlans as 0s */
-			memset(&ivi->vlan, 0, VLAN_HLEN);
+			ivi->vlan = 0;
 
 		mutex_unlock(&bp->vfdb->bulletin_mutex);
 	}
@@ -3071,7 +3071,7 @@ enum sample_bulletin_result bnx2x_sample_bulletin(struct bnx2x *bp)
 	if (bulletin->valid_bitmap & 1 << MAC_ADDR_VALID &&
 	    !ether_addr_equal(bulletin->mac, bp->old_bulletin.mac)) {
 		/* update new mac to net device */
-		memcpy(bp->dev->dev_addr, bulletin->mac, ETH_ALEN);
+		eth_hw_addr_set(bp->dev, bulletin->mac);
 	}
 
 	if (bulletin->valid_bitmap & (1 << LINK_VALID)) {

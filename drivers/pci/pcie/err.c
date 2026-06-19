@@ -50,14 +50,20 @@ static int report_error_detected(struct pci_dev *dev,
 				 pci_channel_state_t state,
 				 enum pci_ers_result *result)
 {
+	struct pci_driver *pdrv;
 	pci_ers_result_t vote;
 	const struct pci_error_handlers *err_handler;
 
 	device_lock(&dev->dev);
-	if (!pci_dev_set_io_state(dev, state) ||
-		!dev->driver ||
-		!dev->driver->err_handler ||
-		!dev->driver->err_handler->error_detected) {
+	pdrv = dev->driver;
+	if (pci_dev_is_disconnected(dev)) {
+		vote = PCI_ERS_RESULT_DISCONNECT;
+	} else if (!pci_dev_set_io_state(dev, state)) {
+		pci_info(dev, "can't recover (state transition %u -> %u invalid)\n",
+			dev->error_state, state);
+		vote = PCI_ERS_RESULT_NONE;
+	} else if (!pdrv || !pdrv->err_handler ||
+		   !pdrv->err_handler->error_detected) {
 		/*
 		 * If any device in the subtree does not have an error_detected
 		 * callback, PCI_ERS_RESULT_NO_AER_DRIVER prevents subsequent
@@ -71,7 +77,7 @@ static int report_error_detected(struct pci_dev *dev,
 			vote = PCI_ERS_RESULT_NONE;
 		}
 	} else {
-		err_handler = dev->driver->err_handler;
+		err_handler = pdrv->err_handler;
 		vote = err_handler->error_detected(dev, state);
 	}
 	pci_uevent_ers(dev, vote);
@@ -104,22 +110,34 @@ static int report_normal_detected(struct pci_dev *dev, void *data)
 
 static int report_perm_failure_detected(struct pci_dev *dev, void *data)
 {
+	struct pci_driver *pdrv;
+	const struct pci_error_handlers *err_handler;
+
+	device_lock(&dev->dev);
+	pdrv = dev->driver;
+	if (!pdrv || !pdrv->err_handler || !pdrv->err_handler->error_detected)
+		goto out;
+
+	err_handler = pdrv->err_handler;
+	err_handler->error_detected(dev, pci_channel_io_perm_failure);
+out:
 	pci_uevent_ers(dev, PCI_ERS_RESULT_DISCONNECT);
+	device_unlock(&dev->dev);
 	return 0;
 }
 
 static int report_mmio_enabled(struct pci_dev *dev, void *data)
 {
+	struct pci_driver *pdrv;
 	pci_ers_result_t vote, *result = data;
 	const struct pci_error_handlers *err_handler;
 
 	device_lock(&dev->dev);
-	if (!dev->driver ||
-		!dev->driver->err_handler ||
-		!dev->driver->err_handler->mmio_enabled)
+	pdrv = dev->driver;
+	if (!pdrv || !pdrv->err_handler || !pdrv->err_handler->mmio_enabled)
 		goto out;
 
-	err_handler = dev->driver->err_handler;
+	err_handler = pdrv->err_handler;
 	vote = err_handler->mmio_enabled(dev);
 	*result = merge_result(*result, vote);
 out:
@@ -129,16 +147,17 @@ out:
 
 static int report_slot_reset(struct pci_dev *dev, void *data)
 {
+	struct pci_driver *pdrv;
 	pci_ers_result_t vote, *result = data;
 	const struct pci_error_handlers *err_handler;
 
 	device_lock(&dev->dev);
-	if (!dev->driver ||
-		!dev->driver->err_handler ||
-		!dev->driver->err_handler->slot_reset)
+	pdrv = dev->driver;
+	if (!pci_dev_set_io_state(dev, pci_channel_io_normal) ||
+	    !pdrv || !pdrv->err_handler || !pdrv->err_handler->slot_reset)
 		goto out;
 
-	err_handler = dev->driver->err_handler;
+	err_handler = pdrv->err_handler;
 	vote = err_handler->slot_reset(dev);
 	*result = merge_result(*result, vote);
 out:
@@ -148,16 +167,16 @@ out:
 
 static int report_resume(struct pci_dev *dev, void *data)
 {
+	struct pci_driver *pdrv;
 	const struct pci_error_handlers *err_handler;
 
 	device_lock(&dev->dev);
+	pdrv = dev->driver;
 	if (!pci_dev_set_io_state(dev, pci_channel_io_normal) ||
-		!dev->driver ||
-		!dev->driver->err_handler ||
-		!dev->driver->err_handler->resume)
+	    !pdrv || !pdrv->err_handler || !pdrv->err_handler->resume)
 		goto out;
 
-	err_handler = dev->driver->err_handler;
+	err_handler = pdrv->err_handler;
 	err_handler->resume(dev);
 out:
 	pci_uevent_ers(dev, PCI_ERS_RESULT_RECOVERED);
@@ -217,20 +236,23 @@ pci_ers_result_t pcie_do_recovery(struct pci_dev *dev,
 	pci_walk_bridge(bridge, pci_pm_runtime_get_sync, NULL);
 
 	pci_dbg(bridge, "broadcast error_detected message\n");
-	if (state == pci_channel_io_frozen) {
+	if (state == pci_channel_io_frozen)
 		pci_walk_bridge(bridge, report_frozen_detected, &status);
-		if (reset_subordinates(bridge) != PCI_ERS_RESULT_RECOVERED) {
-			pci_warn(bridge, "subordinate device reset failed\n");
-			goto failed;
-		}
-	} else {
+	else
 		pci_walk_bridge(bridge, report_normal_detected, &status);
-	}
 
 	if (status == PCI_ERS_RESULT_CAN_RECOVER) {
 		status = PCI_ERS_RESULT_RECOVERED;
 		pci_dbg(bridge, "broadcast mmio_enabled message\n");
 		pci_walk_bridge(bridge, report_mmio_enabled, &status);
+	}
+
+	if (status == PCI_ERS_RESULT_NEED_RESET ||
+	    state == pci_channel_io_frozen) {
+		if (reset_subordinates(bridge) != PCI_ERS_RESULT_RECOVERED) {
+			pci_warn(bridge, "subordinate device reset failed\n");
+			goto failed;
+		}
 	}
 
 	if (status == PCI_ERS_RESULT_NEED_RESET) {
@@ -271,7 +293,6 @@ failed:
 
 	pci_walk_bridge(bridge, report_perm_failure_detected, NULL);
 
-	/* TODO: Should kernel panic here? */
 	pci_info(bridge, "device recovery failed\n");
 
 	return status;

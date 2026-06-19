@@ -679,12 +679,10 @@ static int dvb_frontend_thread(void *data)
 	set_freezable();
 	while (1) {
 		up(&fepriv->sem);	    /* is locked when we enter the thread... */
-restart:
-		wait_event_interruptible_timeout(fepriv->wait_queue,
-						 dvb_frontend_should_wakeup(fe) ||
-						 kthread_should_stop() ||
-						 freezing(current),
-			fepriv->delay);
+		wait_event_freezable_timeout(fepriv->wait_queue,
+					     dvb_frontend_should_wakeup(fe) ||
+					     kthread_should_stop(),
+					     fepriv->delay);
 
 		if (kthread_should_stop() || dvb_frontend_is_exiting(fe)) {
 			/* got signal or quitting */
@@ -693,9 +691,6 @@ restart:
 			fe->exit = DVB_FE_NORMAL_EXIT;
 			break;
 		}
-
-		if (try_to_freeze())
-			goto restart;
 
 		if (down_interruptible(&fepriv->sem))
 			break;
@@ -926,6 +921,7 @@ static void dvb_frontend_get_frequency_limits(struct dvb_frontend *fe,
 
 	/* If the standard is for satellite, convert frequencies to kHz */
 	switch (c->delivery_system) {
+	case SYS_DSS:
 	case SYS_DVBS:
 	case SYS_DVBS2:
 	case SYS_TURBO:
@@ -951,6 +947,7 @@ static u32 dvb_frontend_get_stepsize(struct dvb_frontend *fe)
 	u32 step = max(fe_step, tuner_step);
 
 	switch (c->delivery_system) {
+	case SYS_DSS:
 	case SYS_DVBS:
 	case SYS_DVBS2:
 	case SYS_TURBO:
@@ -982,6 +979,7 @@ static int dvb_frontend_check_parameters(struct dvb_frontend *fe)
 
 	/* range check: symbol rate */
 	switch (c->delivery_system) {
+	case SYS_DSS:
 	case SYS_DVBS:
 	case SYS_DVBS2:
 	case SYS_TURBO:
@@ -1048,6 +1046,10 @@ static int dvb_frontend_clear_cache(struct dvb_frontend *fe)
 	c->scrambling_sequence_index = 0;/* default sequence */
 
 	switch (c->delivery_system) {
+	case SYS_DSS:
+		c->modulation = QPSK;
+		c->rolloff = ROLLOFF_20;
+		break;
 	case SYS_DVBS:
 	case SYS_DVBS2:
 	case SYS_TURBO:
@@ -1829,6 +1831,7 @@ static void prepare_tuning_algo_parameters(struct dvb_frontend *fe)
 	} else {
 		/* default values */
 		switch (c->delivery_system) {
+		case SYS_DSS:
 		case SYS_DVBS:
 		case SYS_DVBS2:
 		case SYS_ISDBS:
@@ -2298,6 +2301,9 @@ static int dtv_set_frontend(struct dvb_frontend *fe)
 	case SYS_DVBC_ANNEX_C:
 		rolloff = 113;
 		break;
+	case SYS_DSS:
+		rolloff = 120;
+		break;
 	case SYS_DVBS:
 	case SYS_TURBO:
 	case SYS_ISDBS:
@@ -2566,8 +2572,7 @@ static int dvb_frontend_handle_ioctl(struct file *file,
 
 	case FE_DISEQC_SEND_BURST:
 		if (fe->ops.diseqc_send_burst) {
-			err = fe->ops.diseqc_send_burst(fe,
-						(enum fe_sec_mini_cmd)parg);
+			err = fe->ops.diseqc_send_burst(fe, (long)parg);
 			fepriv->state = FESTATE_DISEQC;
 			fepriv->status = 0;
 		}
@@ -2575,9 +2580,8 @@ static int dvb_frontend_handle_ioctl(struct file *file,
 
 	case FE_SET_TONE:
 		if (fe->ops.set_tone) {
-			err = fe->ops.set_tone(fe,
-					       (enum fe_sec_tone_mode)parg);
-			fepriv->tone = (enum fe_sec_tone_mode)parg;
+			fepriv->tone = (long)parg;
+			err = fe->ops.set_tone(fe, fepriv->tone);
 			fepriv->state = FESTATE_DISEQC;
 			fepriv->status = 0;
 		}
@@ -2585,9 +2589,8 @@ static int dvb_frontend_handle_ioctl(struct file *file,
 
 	case FE_SET_VOLTAGE:
 		if (fe->ops.set_voltage) {
-			err = fe->ops.set_voltage(fe,
-						  (enum fe_sec_voltage)parg);
-			fepriv->voltage = (enum fe_sec_voltage)parg;
+			fepriv->voltage = (long)parg;
+			err = fe->ops.set_voltage(fe, fepriv->voltage);
 			fepriv->state = FESTATE_DISEQC;
 			fepriv->status = 0;
 		}
@@ -2769,7 +2772,17 @@ static int dvb_frontend_open(struct inode *inode, struct file *file)
 	if (fe->exit == DVB_FE_DEVICE_REMOVED)
 		return -ENODEV;
 
-	if (adapter->mfe_shared) {
+	if (adapter->mfe_shared == 2) {
+		mutex_lock(&adapter->mfe_lock);
+		if ((file->f_flags & O_ACCMODE) != O_RDONLY) {
+			if (adapter->mfe_dvbdev &&
+			    !adapter->mfe_dvbdev->writers) {
+				mutex_unlock(&adapter->mfe_lock);
+				return -EBUSY;
+			}
+			adapter->mfe_dvbdev = dvbdev;
+		}
+	} else if (adapter->mfe_shared) {
 		mutex_lock(&adapter->mfe_lock);
 
 		if (!adapter->mfe_dvbdev)
@@ -2947,7 +2960,9 @@ int dvb_frontend_suspend(struct dvb_frontend *fe)
 	else if (fe->ops.tuner_ops.sleep)
 		ret = fe->ops.tuner_ops.sleep(fe);
 
-	if (fe->ops.sleep)
+	if (fe->ops.suspend)
+		ret = fe->ops.suspend(fe);
+	else if (fe->ops.sleep)
 		ret = fe->ops.sleep(fe);
 
 	return ret;
@@ -2963,7 +2978,9 @@ int dvb_frontend_resume(struct dvb_frontend *fe)
 		fe->id);
 
 	fe->exit = DVB_FE_DEVICE_RESUME;
-	if (fe->ops.init)
+	if (fe->ops.resume)
+		ret = fe->ops.resume(fe);
+	else if (fe->ops.init)
 		ret = fe->ops.init(fe);
 
 	if (fe->ops.tuner_ops.resume)

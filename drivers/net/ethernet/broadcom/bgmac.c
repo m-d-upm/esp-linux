@@ -1367,8 +1367,7 @@ static void bgmac_get_strings(struct net_device *dev, u32 stringset,
 		return;
 
 	for (i = 0; i < BGMAC_STATS_LEN; i++)
-		strlcpy(data + i * ETH_GSTRING_LEN,
-			bgmac_get_strings_stats[i].name, ETH_GSTRING_LEN);
+		ethtool_puts(&data, bgmac_get_strings_stats[i].name);
 }
 
 static void bgmac_get_ethtool_stats(struct net_device *dev,
@@ -1395,8 +1394,8 @@ static void bgmac_get_ethtool_stats(struct net_device *dev,
 static void bgmac_get_drvinfo(struct net_device *net_dev,
 			      struct ethtool_drvinfo *info)
 {
-	strlcpy(info->driver, KBUILD_MODNAME, sizeof(info->driver));
-	strlcpy(info->bus_info, "AXI", sizeof(info->bus_info));
+	strscpy(info->driver, KBUILD_MODNAME, sizeof(info->driver));
+	strscpy(info->bus_info, "AXI", sizeof(info->bus_info));
 }
 
 static const struct ethtool_ops bgmac_ethtool_ops = {
@@ -1447,10 +1446,10 @@ int bgmac_phy_connect_direct(struct bgmac *bgmac)
 	struct phy_device *phy_dev;
 	int err;
 
-	phy_dev = fixed_phy_register(PHY_POLL, &fphy_status, NULL);
+	phy_dev = fixed_phy_register(&fphy_status, NULL);
 	if (IS_ERR(phy_dev)) {
 		dev_err(bgmac->dev, "Failed to register fixed PHY device\n");
-		return -ENODEV;
+		return PTR_ERR(phy_dev);
 	}
 
 	err = phy_connect_direct(bgmac->net_dev, phy_dev, bgmac_adjust_link,
@@ -1529,7 +1528,7 @@ int bgmac_enet_probe(struct bgmac *bgmac)
 	if (bcm47xx_nvram_getenv("et0_no_txint", NULL, 0) == 0)
 		bgmac->int_mask &= ~BGMAC_IS_TX_MASK;
 
-	netif_napi_add(net_dev, &bgmac->napi, bgmac_poll, BGMAC_WEIGHT);
+	netif_napi_add(net_dev, &bgmac->napi, bgmac_poll);
 
 	err = bgmac_phy_connect(bgmac);
 	if (err) {
@@ -1626,4 +1625,5 @@ int bgmac_enet_resume(struct bgmac *bgmac)
 EXPORT_SYMBOL_GPL(bgmac_enet_resume);
 
 MODULE_AUTHOR("Rafał Miłecki");
+MODULE_DESCRIPTION("Broadcom iProc GBit driver");
 MODULE_LICENSE("GPL");

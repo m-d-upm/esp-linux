@@ -2120,9 +2120,12 @@ static int atl1_tso(struct atl1_adapter *adapter, struct sk_buff *skb,
 
 			real_len = (((unsigned char *)iph - skb->data) +
 				ntohs(iph->tot_len));
-			if (real_len < skb->len)
-				pskb_trim(skb, real_len);
-			hdr_len = (skb_transport_offset(skb) + tcp_hdrlen(skb));
+			if (real_len < skb->len) {
+				err = pskb_trim(skb, real_len);
+				if (err)
+					return err;
+			}
+			hdr_len = skb_tcp_all_headers(skb);
 			if (skb->len == hdr_len) {
 				iph->check = 0;
 				tcp_hdr(skb)->check =
@@ -2215,7 +2218,7 @@ static bool atl1_tx_map(struct atl1_adapter *adapter, struct sk_buff *skb,
 	retval = (ptpd->word3 >> TPD_SEGMENT_EN_SHIFT) & TPD_SEGMENT_EN_MASK;
 	if (retval) {
 		/* TSO */
-		hdr_len = skb_transport_offset(skb) + tcp_hdrlen(skb);
+		hdr_len = skb_tcp_all_headers(skb);
 		buffer_info->length = hdr_len;
 		page = virt_to_page(skb->data);
 		offset = offset_in_page(skb->data);
@@ -2400,10 +2403,10 @@ static netdev_tx_t atl1_xmit_frame(struct sk_buff *skb,
 	mss = skb_shinfo(skb)->gso_size;
 	if (mss) {
 		if (skb->protocol == htons(ETH_P_IP)) {
-			proto_hdr_len = (skb_transport_offset(skb) +
-					 tcp_hdrlen(skb));
+			proto_hdr_len = skb_tcp_all_headers(skb);
 			if (unlikely(proto_hdr_len > len))
 				goto drop_packet;
+
 			/* need additional TPD ? */
 			if (proto_hdr_len != len)
 				count += (len - proto_hdr_len +
@@ -2478,15 +2481,13 @@ static int atl1_rings_clean(struct napi_struct *napi, int budget)
 
 static inline int atl1_sched_rings_clean(struct atl1_adapter* adapter)
 {
-	if (!napi_schedule_prep(&adapter->napi))
+	if (!napi_schedule(&adapter->napi))
 		/* It is possible in case even the RX/TX ints are disabled via IMR
 		 * register the ISR bits are set anyway (but do not produce IRQ).
 		 * To handle such situation the napi functions used to check is
 		 * something scheduled or not.
 		 */
 		return 0;
-
-	__napi_schedule(&adapter->napi);
 
 	/*
 	 * Disable RX/TX ints via IMR register if it is
@@ -2590,8 +2591,8 @@ static irqreturn_t atl1_intr(int irq, void *data)
  */
 static void atl1_phy_config(struct timer_list *t)
 {
-	struct atl1_adapter *adapter = from_timer(adapter, t,
-						  phy_config_timer);
+	struct atl1_adapter *adapter = timer_container_of(adapter, t,
+							  phy_config_timer);
 	struct atl1_hw *hw = &adapter->hw;
 	unsigned long flags;
 
@@ -2675,7 +2676,7 @@ static void atl1_down(struct atl1_adapter *adapter)
 
 	napi_disable(&adapter->napi);
 	netif_stop_queue(netdev);
-	del_timer_sync(&adapter->phy_config_timer);
+	timer_delete_sync(&adapter->phy_config_timer);
 	adapter->phy_timer_pending = false;
 
 	atlx_irq_disable(adapter);
@@ -2721,7 +2722,7 @@ static int atl1_change_mtu(struct net_device *netdev, int new_mtu)
 	adapter->rx_buffer_len = (max_frame + 7) & ~7;
 	adapter->hw.rx_jumbo_th = adapter->rx_buffer_len / 8;
 
-	netdev->mtu = new_mtu;
+	WRITE_ONCE(netdev->mtu, new_mtu);
 	if (netif_running(netdev)) {
 		atl1_down(adapter);
 		atl1_up(adapter);
@@ -3012,7 +3013,7 @@ static int atl1_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	netdev->netdev_ops = &atl1_netdev_ops;
 	netdev->watchdog_timeo = 5 * HZ;
-	netif_napi_add(netdev, &adapter->napi, atl1_rings_clean, 64);
+	netif_napi_add(netdev, &adapter->napi, atl1_rings_clean);
 
 	netdev->ethtool_ops = &atl1_ethtool_ops;
 	adapter->bd_number = cards_found;
@@ -3061,7 +3062,7 @@ static int atl1_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		/* mark random mac */
 		netdev->addr_assign_type = NET_ADDR_RANDOM;
 	}
-	memcpy(netdev->dev_addr, adapter->hw.mac_addr, netdev->addr_len);
+	eth_hw_addr_set(netdev, adapter->hw.mac_addr);
 
 	if (!is_valid_ether_addr(netdev->dev_addr)) {
 		err = -EIO;
@@ -3375,8 +3376,8 @@ static void atl1_get_drvinfo(struct net_device *netdev,
 {
 	struct atl1_adapter *adapter = netdev_priv(netdev);
 
-	strlcpy(drvinfo->driver, ATLX_DRIVER_NAME, sizeof(drvinfo->driver));
-	strlcpy(drvinfo->bus_info, pci_name(adapter->pdev),
+	strscpy(drvinfo->driver, ATLX_DRIVER_NAME, sizeof(drvinfo->driver));
+	strscpy(drvinfo->bus_info, pci_name(adapter->pdev),
 		sizeof(drvinfo->bus_info));
 }
 
@@ -3472,7 +3473,9 @@ static void atl1_get_regs(struct net_device *netdev, struct ethtool_regs *regs,
 }
 
 static void atl1_get_ringparam(struct net_device *netdev,
-	struct ethtool_ringparam *ring)
+			       struct ethtool_ringparam *ring,
+			       struct kernel_ethtool_ringparam *kernel_ring,
+			       struct netlink_ext_ack *extack)
 {
 	struct atl1_adapter *adapter = netdev_priv(netdev);
 	struct atl1_tpd_ring *txdr = &adapter->tpd_ring;
@@ -3485,7 +3488,9 @@ static void atl1_get_ringparam(struct net_device *netdev,
 }
 
 static int atl1_set_ringparam(struct net_device *netdev,
-	struct ethtool_ringparam *ring)
+			      struct ethtool_ringparam *ring,
+			      struct kernel_ethtool_ringparam *kernel_ring,
+			      struct netlink_ext_ack *extack)
 {
 	struct atl1_adapter *adapter = netdev_priv(netdev);
 	struct atl1_tpd_ring *tpdr = &adapter->tpd_ring;

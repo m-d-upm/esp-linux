@@ -2,13 +2,14 @@
 #include <linux/io.h>
 #include <linux/slab.h>
 #include <linux/memblock.h>
-#include <linux/mem_encrypt.h>
+#include <linux/cc_platform.h>
 #include <linux/pgtable.h>
 
 #include <asm/set_memory.h>
 #include <asm/realmode.h>
 #include <asm/tlbflush.h>
 #include <asm/crash.h>
+#include <asm/msr.h>
 #include <asm/sev.h>
 
 struct real_mode_header *real_mode_header;
@@ -61,19 +62,21 @@ void __init reserve_real_mode(void)
 		set_real_mode_mem(mem);
 
 	/*
-	 * Unconditionally reserve the entire fisrt 1M, see comment in
+	 * Unconditionally reserve the entire first 1M, see comment in
 	 * setup_arch().
 	 */
 	memblock_reserve(0, SZ_1M);
+
+	memblock_clear_kho_scratch(0, SZ_1M);
 }
 
-static void sme_sev_setup_real_mode(struct trampoline_header *th)
+static void __init sme_sev_setup_real_mode(struct trampoline_header *th)
 {
 #ifdef CONFIG_AMD_MEM_ENCRYPT
-	if (sme_active())
+	if (cc_platform_has(CC_ATTR_HOST_MEM_ENCRYPT))
 		th->flags |= TH_FLAGS_SME_ACTIVE;
 
-	if (sev_es_active()) {
+	if (cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT)) {
 		/*
 		 * Skip the call to verify_cpu() in secondary_startup_64 as it
 		 * will cause #VC exceptions when the AP can't handle them yet.
@@ -108,7 +111,7 @@ static void __init setup_real_mode(void)
 	 * decrypted memory in order to bring up other processors
 	 * successfully. This is not needed for SEV.
 	 */
-	if (sme_active())
+	if (cc_platform_has(CC_ATTR_HOST_MEM_ENCRYPT))
 		set_memory_decrypted((unsigned long)base, size >> PAGE_SHIFT);
 
 	memcpy(base, real_mode_blob, size);
@@ -145,7 +148,7 @@ static void __init setup_real_mode(void)
 	 * Some AMD processors will #GP(0) if EFER.LMA is set in WRMSR
 	 * so we need to mask it out.
 	 */
-	rdmsrl(MSR_EFER, efer);
+	rdmsrq(MSR_EFER, efer);
 	trampoline_header->efer = efer & ~EFER_LMA;
 
 	trampoline_header->start = (u64) secondary_startup_64;
@@ -153,6 +156,9 @@ static void __init setup_real_mode(void)
 	*trampoline_cr4_features = mmu_cr4_features;
 
 	trampoline_header->flags = 0;
+
+	trampoline_lock = &trampoline_header->lock;
+	*trampoline_lock = 0;
 
 	trampoline_pgd = (u64 *) __va(real_mode_header->trampoline_pgd);
 
@@ -200,14 +206,18 @@ static void __init set_real_mode_permissions(void)
 	set_memory_x((unsigned long) text_start, text_size >> PAGE_SHIFT);
 }
 
-static int __init init_real_mode(void)
+void __init init_real_mode(void)
 {
 	if (!real_mode_header)
 		panic("Real mode trampoline was not allocated");
 
 	setup_real_mode();
 	set_real_mode_permissions();
+}
 
+static int __init do_init_real_mode(void)
+{
+	x86_platform.realmode_init();
 	return 0;
 }
-early_initcall(init_real_mode);
+early_initcall(do_init_real_mode);

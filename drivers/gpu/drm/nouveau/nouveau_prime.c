@@ -23,6 +23,7 @@
  */
 
 #include <linux/dma-buf.h>
+#include <drm/ttm/ttm_tt.h>
 
 #include "nouveau_drv.h"
 #include "nouveau_gem.h"
@@ -49,7 +50,7 @@ struct drm_gem_object *nouveau_gem_prime_import_sg_table(struct drm_device *dev,
 
 	dma_resv_lock(robj, NULL);
 	nvbo = nouveau_bo_alloc(&drm->client, &size, &align,
-				NOUVEAU_GEM_DOMAIN_GART, 0, 0);
+				NOUVEAU_GEM_DOMAIN_GART, 0, 0, true);
 	if (IS_ERR(nvbo)) {
 		obj = ERR_CAST(nvbo);
 		goto unlock;
@@ -89,25 +90,10 @@ int nouveau_gem_prime_pin(struct drm_gem_object *obj)
 	int ret;
 
 	/* pin buffer into GTT */
-	ret = nouveau_bo_pin(nvbo, NOUVEAU_GEM_DOMAIN_GART, false);
+	ret = nouveau_bo_pin_locked(nvbo, NOUVEAU_GEM_DOMAIN_GART, false);
 	if (ret)
-		return -EINVAL;
+		ret = -EINVAL;
 
-	ret = ttm_bo_reserve(&nvbo->bo, false, false, NULL);
-	if (ret)
-		goto error;
-
-	if (nvbo->bo.moving)
-		ret = dma_fence_wait(nvbo->bo.moving, true);
-
-	ttm_bo_unreserve(&nvbo->bo);
-	if (ret)
-		goto error;
-
-	return ret;
-
-error:
-	nouveau_bo_unpin(nvbo);
 	return ret;
 }
 
@@ -115,5 +101,28 @@ void nouveau_gem_prime_unpin(struct drm_gem_object *obj)
 {
 	struct nouveau_bo *nvbo = nouveau_gem_object(obj);
 
-	nouveau_bo_unpin(nvbo);
+	nouveau_bo_unpin_locked(nvbo);
+}
+
+struct dma_buf *nouveau_gem_prime_export(struct drm_gem_object *gobj,
+					 int flags)
+{
+	struct nouveau_bo *nvbo = nouveau_gem_object(gobj);
+	struct ttm_operation_ctx ctx = {
+		.interruptible = true,
+		.no_wait_gpu = true,
+		/* We opt to avoid OOM on system pages allocations */
+		.gfp_retry_mayfail = true,
+		.allow_res_evict = false,
+	};
+	int ret;
+
+	if (nvbo->no_share)
+		return ERR_PTR(-EPERM);
+
+	ret = ttm_bo_setup_export(&nvbo->bo, &ctx);
+	if (ret)
+		return ERR_PTR(ret);
+
+	return drm_gem_prime_export(gobj, flags);
 }

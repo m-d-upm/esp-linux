@@ -27,8 +27,8 @@
  */
 struct pt_regs {
 #ifdef CONFIG_32BIT
-	/* Pad bytes for argument save space on the stack. */
-	unsigned long pad0[8];
+	/* Saved syscall stack arguments; entries 0-3 unused. */
+	unsigned long args[8];
 #endif
 
 	/* Saved main processor registers. */
@@ -156,6 +156,8 @@ static inline long regs_return_value(struct pt_regs *regs)
 }
 
 #define instruction_pointer(regs) ((regs)->cp0_epc)
+extern unsigned long exception_ip(struct pt_regs *regs);
+#define exception_ip(regs) exception_ip(regs)
 #define profile_pc(regs) instruction_pointer(regs)
 
 extern asmlinkage long syscall_trace_enter(struct pt_regs *regs);

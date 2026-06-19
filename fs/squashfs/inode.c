@@ -62,11 +62,15 @@ static int squashfs_new_inode(struct super_block *sb, struct inode *inode,
 
 	i_uid_write(inode, i_uid);
 	i_gid_write(inode, i_gid);
-	inode->i_mtime.tv_sec = le32_to_cpu(sqsh_ino->mtime);
-	inode->i_atime.tv_sec = inode->i_mtime.tv_sec;
-	inode->i_ctime.tv_sec = inode->i_mtime.tv_sec;
+	inode_set_mtime(inode, le32_to_cpu(sqsh_ino->mtime), 0);
+	inode_set_atime(inode, inode_get_mtime_sec(inode), 0);
+	inode_set_ctime(inode, inode_get_mtime_sec(inode), 0);
 	inode->i_mode = le16_to_cpu(sqsh_ino->mode);
 	inode->i_size = 0;
+
+	/* File type must not be set at this moment, for it will later be set by the caller. */
+	if (inode->i_mode & S_IFMT)
+		err = -EIO;
 
 	return err;
 }
@@ -164,7 +168,7 @@ int squashfs_read_inode(struct inode *inode, long long ino)
 		}
 
 		set_nlink(inode, 1);
-		inode->i_fop = &generic_ro_fops;
+		inode->i_fop = &squashfs_file_operations;
 		inode->i_mode |= S_IFREG;
 		inode->i_blocks = ((inode->i_size - 1) >> 9) + 1;
 		squashfs_i(inode)->fragment_block = frag_blk;
@@ -222,7 +226,7 @@ int squashfs_read_inode(struct inode *inode, long long ino)
 		xattr_id = le32_to_cpu(sqsh_ino->xattr);
 		set_nlink(inode, le32_to_cpu(sqsh_ino->nlink));
 		inode->i_op = &squashfs_inode_ops;
-		inode->i_fop = &generic_ro_fops;
+		inode->i_fop = &squashfs_file_operations;
 		inode->i_mode |= S_IFREG;
 		inode->i_blocks = (inode->i_size -
 				le64_to_cpu(sqsh_ino->sparse) + 511) >> 9;

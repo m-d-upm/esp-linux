@@ -357,7 +357,7 @@ static void rt2x00lib_fill_tx_status(struct rt2x00_dev *rt2x00dev,
 	}
 
 	/*
-	 * Every single frame has it's own tx status, hence report
+	 * Every single frame has its own tx status, hence report
 	 * every frame as ampdu of size 1.
 	 *
 	 * TODO: if we can find out how many frames were aggregated
@@ -496,7 +496,7 @@ void rt2x00lib_txdone(struct queue_entry *entry,
 	/*
 	 * If the IV/EIV data was stripped from the frame before it was
 	 * passed to the hardware, we should now reinsert it again because
-	 * mac80211 will expect the same data to be present it the
+	 * mac80211 will expect the same data to be present in the
 	 * frame as it was passed to us.
 	 */
 	if (rt2x00_has_cap_hw_crypto(rt2x00dev))
@@ -534,7 +534,7 @@ void rt2x00lib_txdone(struct queue_entry *entry,
 	 */
 	if (!(skbdesc_flags & SKBDESC_NOT_MAC80211)) {
 		if (rt2x00_has_cap_flag(rt2x00dev, REQUIRE_TASKLET_CONTEXT))
-			ieee80211_tx_status(rt2x00dev->hw, entry->skb);
+			ieee80211_tx_status_skb(rt2x00dev->hw, entry->skb);
 		else
 			ieee80211_tx_status_ni(rt2x00dev->hw, entry->skb);
 	} else {
@@ -679,7 +679,7 @@ static void rt2x00lib_rxdone_check_ps(struct rt2x00_dev *rt2x00dev,
 	/* Check whenever the PHY can be turned off again. */
 
 	/* 1. What about buffered unicast traffic for our AID? */
-	cam = ieee80211_check_tim(tim_ie, tim_len, rt2x00dev->aid);
+	cam = ieee80211_check_tim(tim_ie, tim_len, rt2x00dev->aid, false);
 
 	/* 2. Maybe the AP wants to send multicast/broadcast data? */
 	cam |= (tim_ie->bitmap_ctrl & 0x01);
@@ -1095,6 +1095,19 @@ static void rt2x00lib_remove_hw(struct rt2x00_dev *rt2x00dev)
 	kfree(rt2x00dev->chan_survey);
 }
 
+static const struct ieee80211_tpt_blink rt2x00_tpt_blink[] = {
+	{ .throughput = 0 * 1024, .blink_time = 334 },
+	{ .throughput = 1 * 1024, .blink_time = 260 },
+	{ .throughput = 2 * 1024, .blink_time = 220 },
+	{ .throughput = 5 * 1024, .blink_time = 190 },
+	{ .throughput = 10 * 1024, .blink_time = 170 },
+	{ .throughput = 25 * 1024, .blink_time = 150 },
+	{ .throughput = 54 * 1024, .blink_time = 130 },
+	{ .throughput = 120 * 1024, .blink_time = 110 },
+	{ .throughput = 265 * 1024, .blink_time = 80 },
+	{ .throughput = 586 * 1024, .blink_time = 50 },
+};
+
 static int rt2x00lib_probe_hw(struct rt2x00_dev *rt2x00dev)
 {
 	struct hw_mode_spec *spec = &rt2x00dev->spec;
@@ -1175,6 +1188,11 @@ static int rt2x00lib_probe_hw(struct rt2x00_dev *rt2x00dev)
 	RT2X00_TASKLET_INIT(autowake_tasklet);
 
 #undef RT2X00_TASKLET_INIT
+
+	ieee80211_create_tpt_led_trigger(rt2x00dev->hw,
+					 IEEE80211_TPT_LEDTRIG_FL_RADIO,
+					 rt2x00_tpt_blink,
+					 ARRAY_SIZE(rt2x00_tpt_blink));
 
 	/*
 	 * Register HW.
@@ -1373,8 +1391,8 @@ int rt2x00lib_probe_dev(struct rt2x00_dev *rt2x00dev)
 	mutex_init(&rt2x00dev->conf_mutex);
 	INIT_LIST_HEAD(&rt2x00dev->bar_list);
 	spin_lock_init(&rt2x00dev->bar_list_lock);
-	hrtimer_init(&rt2x00dev->txstatus_timer, CLOCK_MONOTONIC,
-		     HRTIMER_MODE_REL);
+	hrtimer_setup(&rt2x00dev->txstatus_timer, hrtimer_dummy_timeout, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL);
 
 	set_bit(DEVICE_STATE_PRESENT, &rt2x00dev->flags);
 

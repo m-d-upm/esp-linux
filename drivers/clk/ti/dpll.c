@@ -1,18 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * OMAP DPLL clock support
  *
  * Copyright (C) 2013 Texas Instruments, Inc.
  *
  * Tero Kristo <t-kristo@ti.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed "as is" WITHOUT ANY WARRANTY of any
- * kind, whether express or implied; without even the implied warranty
- * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
 #include <linux/clk.h>
@@ -33,7 +25,6 @@ static const struct clk_ops dpll_m4xen_ck_ops = {
 	.enable		= &omap3_noncore_dpll_enable,
 	.disable	= &omap3_noncore_dpll_disable,
 	.recalc_rate	= &omap4_dpll_regm4xen_recalc,
-	.round_rate	= &omap4_dpll_regm4xen_round_rate,
 	.set_rate	= &omap3_noncore_dpll_set_rate,
 	.set_parent	= &omap3_noncore_dpll_set_parent,
 	.set_rate_and_parent	= &omap3_noncore_dpll_set_rate_and_parent,
@@ -42,8 +33,6 @@ static const struct clk_ops dpll_m4xen_ck_ops = {
 	.save_context	= &omap3_core_dpll_save_context,
 	.restore_context = &omap3_core_dpll_restore_context,
 };
-#else
-static const struct clk_ops dpll_m4xen_ck_ops = {};
 #endif
 
 #if defined(CONFIG_ARCH_OMAP3) || defined(CONFIG_ARCH_OMAP4) || \
@@ -58,7 +47,6 @@ static const struct clk_ops dpll_ck_ops = {
 	.enable		= &omap3_noncore_dpll_enable,
 	.disable	= &omap3_noncore_dpll_disable,
 	.recalc_rate	= &omap3_dpll_recalc,
-	.round_rate	= &omap2_dpll_round_rate,
 	.set_rate	= &omap3_noncore_dpll_set_rate,
 	.set_parent	= &omap3_noncore_dpll_set_parent,
 	.set_rate_and_parent	= &omap3_noncore_dpll_set_rate_and_parent,
@@ -71,7 +59,6 @@ static const struct clk_ops dpll_ck_ops = {
 static const struct clk_ops dpll_no_gate_ck_ops = {
 	.recalc_rate	= &omap3_dpll_recalc,
 	.get_parent	= &omap2_init_dpll_parent,
-	.round_rate	= &omap2_dpll_round_rate,
 	.set_rate	= &omap3_noncore_dpll_set_rate,
 	.set_parent	= &omap3_noncore_dpll_set_parent,
 	.set_rate_and_parent	= &omap3_noncore_dpll_set_rate_and_parent,
@@ -90,7 +77,7 @@ const struct clk_hw_omap_ops clkhwops_omap3_dpll = {};
 static const struct clk_ops omap2_dpll_core_ck_ops = {
 	.get_parent	= &omap2_init_dpll_parent,
 	.recalc_rate	= &omap2_dpllcore_recalc,
-	.round_rate	= &omap2_dpll_round_rate,
+	.determine_rate	= &omap2_dpll_determine_rate,
 	.set_rate	= &omap2_reprogram_dpllcore,
 };
 #else
@@ -101,13 +88,9 @@ static const struct clk_ops omap2_dpll_core_ck_ops = {};
 static const struct clk_ops omap3_dpll_core_ck_ops = {
 	.get_parent	= &omap2_init_dpll_parent,
 	.recalc_rate	= &omap3_dpll_recalc,
-	.round_rate	= &omap2_dpll_round_rate,
+	.determine_rate	= &omap2_dpll_determine_rate,
 };
-#else
-static const struct clk_ops omap3_dpll_core_ck_ops = {};
-#endif
 
-#ifdef CONFIG_ARCH_OMAP3
 static const struct clk_ops omap3_dpll_ck_ops = {
 	.enable		= &omap3_noncore_dpll_enable,
 	.disable	= &omap3_noncore_dpll_disable,
@@ -117,7 +100,6 @@ static const struct clk_ops omap3_dpll_ck_ops = {
 	.set_parent	= &omap3_noncore_dpll_set_parent,
 	.set_rate_and_parent	= &omap3_noncore_dpll_set_rate_and_parent,
 	.determine_rate	= &omap3_noncore_dpll_determine_rate,
-	.round_rate	= &omap2_dpll_round_rate,
 };
 
 static const struct clk_ops omap3_dpll5_ck_ops = {
@@ -129,7 +111,6 @@ static const struct clk_ops omap3_dpll5_ck_ops = {
 	.set_parent	= &omap3_noncore_dpll_set_parent,
 	.set_rate_and_parent	= &omap3_noncore_dpll_set_rate_and_parent,
 	.determine_rate	= &omap3_noncore_dpll_determine_rate,
-	.round_rate	= &omap2_dpll_round_rate,
 };
 
 static const struct clk_ops omap3_dpll_per_ck_ops = {
@@ -141,13 +122,16 @@ static const struct clk_ops omap3_dpll_per_ck_ops = {
 	.set_parent	= &omap3_noncore_dpll_set_parent,
 	.set_rate_and_parent	= &omap3_dpll4_set_rate_and_parent,
 	.determine_rate	= &omap3_noncore_dpll_determine_rate,
-	.round_rate	= &omap2_dpll_round_rate,
 };
 #endif
 
+#if defined(CONFIG_ARCH_OMAP4) || defined(CONFIG_SOC_OMAP5) || \
+        defined(CONFIG_SOC_DRA7XX) || defined(CONFIG_SOC_AM33XX) || \
+	defined(CONFIG_SOC_AM43XX)
 static const struct clk_ops dpll_x2_ck_ops = {
 	.recalc_rate	= &omap3_clkoutx2_recalc,
 };
+#endif
 
 /**
  * _register_dpll - low level registration of a DPLL clock

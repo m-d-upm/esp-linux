@@ -151,11 +151,6 @@ static inline int hpet_set_periodic_freq(unsigned long freq)
 	return 0;
 }
 
-static inline int hpet_rtc_dropped_irq(void)
-{
-	return 0;
-}
-
 static inline int hpet_rtc_timer_init(void)
 {
 	return 0;
@@ -231,7 +226,7 @@ static int cmos_read_time(struct device *dev, struct rtc_time *t)
 	if (!pm_trace_rtc_valid())
 		return -EIO;
 
-	ret = mc146818_get_time(t);
+	ret = mc146818_get_time(t, 1000);
 	if (ret < 0) {
 		dev_err_ratelimited(dev, "unable to read current time\n");
 		return ret;
@@ -307,7 +302,7 @@ static int cmos_read_alarm(struct device *dev, struct rtc_wkalrm *t)
 	 *
 	 * Use the mc146818_avoid_UIP() function to avoid this.
 	 */
-	if (!mc146818_avoid_UIP(cmos_read_alarm_callback, &p))
+	if (!mc146818_avoid_UIP(cmos_read_alarm_callback, 10, &p))
 		return -EIO;
 
 	if (!(p.rtc_control & RTC_DM_BINARY) || RTC_ALWAYS_BCD) {
@@ -556,7 +551,7 @@ static int cmos_set_alarm(struct device *dev, struct rtc_wkalrm *t)
 	 *
 	 * Use mc146818_avoid_UIP() to avoid this.
 	 */
-	if (!mc146818_avoid_UIP(cmos_set_alarm_callback, &p))
+	if (!mc146818_avoid_UIP(cmos_set_alarm_callback, 10, &p))
 		return -ETIMEDOUT;
 
 	cmos->alarm_expires = rtc_tm_to_time64(&t->time);
@@ -645,18 +640,17 @@ static int cmos_nvram_read(void *priv, unsigned int off, void *val,
 	unsigned char *buf = val;
 
 	off += NVRAM_OFFSET;
-	spin_lock_irq(&rtc_lock);
-	for (; count; count--, off++) {
+	for (; count; count--, off++, buf++) {
+		guard(spinlock_irq)(&rtc_lock);
 		if (off < 128)
-			*buf++ = CMOS_READ(off);
+			*buf = CMOS_READ(off);
 		else if (can_bank2)
-			*buf++ = cmos_read_bank2(off);
+			*buf = cmos_read_bank2(off);
 		else
-			break;
+			return -EIO;
 	}
-	spin_unlock_irq(&rtc_lock);
 
-	return count ? -EIO : 0;
+	return 0;
 }
 
 static int cmos_nvram_write(void *priv, unsigned int off, void *val,
@@ -671,23 +665,23 @@ static int cmos_nvram_write(void *priv, unsigned int off, void *val,
 	 * NVRAM to update, updating checksums is also part of its job.
 	 */
 	off += NVRAM_OFFSET;
-	spin_lock_irq(&rtc_lock);
-	for (; count; count--, off++) {
+	for (; count; count--, off++, buf++) {
 		/* don't trash RTC registers */
 		if (off == cmos->day_alrm
 				|| off == cmos->mon_alrm
 				|| off == cmos->century)
-			buf++;
-		else if (off < 128)
-			CMOS_WRITE(*buf++, off);
-		else if (can_bank2)
-			cmos_write_bank2(*buf++, off);
-		else
-			break;
-	}
-	spin_unlock_irq(&rtc_lock);
+			continue;
 
-	return count ? -EIO : 0;
+		guard(spinlock_irq)(&rtc_lock);
+		if (off < 128)
+			CMOS_WRITE(*buf, off);
+		else if (can_bank2)
+			cmos_write_bank2(*buf, off);
+		else
+			return -EIO;
+	}
+
+	return 0;
 }
 
 /*----------------------------------------------------------------*/
@@ -820,16 +814,22 @@ static void rtc_wake_off(struct device *dev)
 }
 
 #ifdef CONFIG_X86
-/* Enable use_acpi_alarm mode for Intel platforms no earlier than 2015 */
 static void use_acpi_alarm_quirks(void)
 {
-	if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL)
+	switch (boot_cpu_data.x86_vendor) {
+	case X86_VENDOR_INTEL:
+		if (dmi_get_bios_year() < 2015)
+			return;
+		break;
+	case X86_VENDOR_AMD:
+	case X86_VENDOR_HYGON:
+		if (dmi_get_bios_year() < 2021)
+			return;
+		break;
+	default:
 		return;
-
+	}
 	if (!is_hpet_enabled())
-		return;
-
-	if (dmi_get_bios_year() < 2015)
 		return;
 
 	use_acpi_alarm = true;
@@ -863,7 +863,7 @@ static void acpi_cmos_wake_setup(struct device *dev)
 		dev_info(dev, "RTC can wake from S4\n");
 
 	/* RTC always wakes from S1/S2/S3, and often S4/STD */
-	device_init_wakeup(dev, 1);
+	device_init_wakeup(dev, true);
 }
 
 static void cmos_check_acpi_rtc_status(struct device *dev,
@@ -914,6 +914,10 @@ static inline void cmos_check_acpi_rtc_status(struct device *dev,
 #else
 #define	INITSECTION	__init
 #endif
+
+#define SECS_PER_DAY	(24 * 60 * 60)
+#define SECS_PER_MONTH	(28 * SECS_PER_DAY)
+#define SECS_PER_YEAR	(365 * SECS_PER_DAY)
 
 static int INITSECTION
 cmos_do_probe(struct device *dev, struct resource *ports, int rtc_irq)
@@ -1020,6 +1024,13 @@ cmos_do_probe(struct device *dev, struct resource *ports, int rtc_irq)
 		retval = PTR_ERR(cmos_rtc.rtc);
 		goto cleanup0;
 	}
+
+	if (cmos_rtc.mon_alrm)
+		cmos_rtc.rtc->alarm_offset_max = SECS_PER_YEAR - 1;
+	else if (cmos_rtc.day_alrm)
+		cmos_rtc.rtc->alarm_offset_max = SECS_PER_MONTH - 1;
+	else
+		cmos_rtc.rtc->alarm_offset_max = SECS_PER_DAY - 1;
 
 	rename_region(ports, dev_name(&cmos_rtc.rtc->dev));
 
@@ -1489,10 +1500,9 @@ static int __init cmos_platform_probe(struct platform_device *pdev)
 	return cmos_do_probe(&pdev->dev, resource, irq);
 }
 
-static int cmos_platform_remove(struct platform_device *pdev)
+static void cmos_platform_remove(struct platform_device *pdev)
 {
 	cmos_do_remove(&pdev->dev);
-	return 0;
 }
 
 static void cmos_platform_shutdown(struct platform_device *pdev)

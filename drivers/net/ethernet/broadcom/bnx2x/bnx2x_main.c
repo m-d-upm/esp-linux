@@ -29,7 +29,6 @@
 #include <linux/slab.h>
 #include <linux/interrupt.h>
 #include <linux/pci.h>
-#include <linux/aer.h>
 #include <linux/init.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
@@ -298,7 +297,7 @@ const u32 dmae_reg_go_c[] = {
 
 /* Global resources for unloading a previously loaded device */
 #define BNX2X_PREV_WAIT_NEEDED 1
-static DEFINE_SEMAPHORE(bnx2x_prev_sem);
+static DEFINE_SEMAPHORE(bnx2x_prev_sem, 1);
 static LIST_HEAD(bnx2x_prev_list);
 
 /* Forward declaration */
@@ -1769,7 +1768,7 @@ static bool bnx2x_trylock_hw_lock(struct bnx2x *bp, u32 resource)
  * @bp:	driver handle
  *
  * Returns the recovery leader resource id according to the engine this function
- * belongs to. Currently only only 2 engines is supported.
+ * belongs to. Currently only 2 engines is supported.
  */
 static int bnx2x_get_leader_lock_resource(struct bnx2x *bp)
 {
@@ -3385,7 +3384,7 @@ static void bnx2x_drv_info_ether_stat(struct bnx2x *bp)
 		&bp->sp_objs->mac_obj;
 	int i;
 
-	strlcpy(ether_stat->version, DRV_MODULE_VERSION,
+	strscpy(ether_stat->version, DRV_MODULE_VERSION,
 		ETH_STAT_INFO_VERSION_LEN);
 
 	/* get DRV_INFO_ETH_STAT_NUM_MACS_REQUIRED macs, placing them in the
@@ -5784,7 +5783,7 @@ void bnx2x_drv_pulse(struct bnx2x *bp)
 
 static void bnx2x_timer(struct timer_list *t)
 {
-	struct bnx2x *bp = from_timer(bp, t, timer);
+	struct bnx2x *bp = timer_container_of(bp, t, timer);
 
 	if (!netif_running(bp->dev))
 		return;
@@ -9475,15 +9474,18 @@ unload_error:
 		}
 	}
 
-	/* Disable HW interrupts, NAPI */
-	bnx2x_netif_stop(bp, 1);
-	/* Delete all NAPI objects */
-	bnx2x_del_all_napi(bp);
-	if (CNIC_LOADED(bp))
-		bnx2x_del_all_napi_cnic(bp);
+	if (!bp->nic_stopped) {
+		/* Disable HW interrupts, NAPI */
+		bnx2x_netif_stop(bp, 1);
+		/* Delete all NAPI objects */
+		bnx2x_del_all_napi(bp);
+		if (CNIC_LOADED(bp))
+			bnx2x_del_all_napi_cnic(bp);
 
-	/* Release IRQs */
-	bnx2x_free_irq(bp);
+		/* Release IRQs */
+		bnx2x_free_irq(bp);
+		bp->nic_stopped = true;
+	}
 
 	/* Reset the chip, unless PCI function is offline. If we reach this
 	 * point following a PCI error handling, it means device is really
@@ -10217,8 +10219,7 @@ static int bnx2x_udp_tunnel_sync(struct net_device *netdev, unsigned int table)
 
 static const struct udp_tunnel_nic_info bnx2x_udp_tunnels = {
 	.sync_table	= bnx2x_udp_tunnel_sync,
-	.flags		= UDP_TUNNEL_NIC_INFO_MAY_SLEEP |
-			  UDP_TUNNEL_NIC_INFO_OPEN_ONLY,
+	.flags		= UDP_TUNNEL_NIC_INFO_OPEN_ONLY,
 	.tables		= {
 		{ .n_entries = 1, .tunnel_types = UDP_TUNNEL_TYPE_VXLAN,  },
 		{ .n_entries = 1, .tunnel_types = UDP_TUNNEL_TYPE_GENEVE, },
@@ -11801,7 +11802,7 @@ static void bnx2x_get_cnic_mac_hwinfo(struct bnx2x *bp)
 		 * as the SAN mac was copied from the primary MAC.
 		 */
 		if (IS_MF_FCOE_AFEX(bp))
-			memcpy(bp->dev->dev_addr, fip_mac, ETH_ALEN);
+			eth_hw_addr_set(bp->dev, fip_mac);
 	} else {
 		val2 = SHMEM_RD(bp, dev_info.port_hw_config[port].
 				iscsi_mac_upper);
@@ -11834,9 +11835,10 @@ static void bnx2x_get_mac_hwinfo(struct bnx2x *bp)
 	u32 val, val2;
 	int func = BP_ABS_FUNC(bp);
 	int port = BP_PORT(bp);
+	u8 addr[ETH_ALEN] = {};
 
 	/* Zero primary MAC configuration */
-	eth_zero_addr(bp->dev->dev_addr);
+	eth_hw_addr_set(bp->dev, addr);
 
 	if (BP_NOMCP(bp)) {
 		BNX2X_ERROR("warning: random MAC workaround active\n");
@@ -11845,8 +11847,10 @@ static void bnx2x_get_mac_hwinfo(struct bnx2x *bp)
 		val2 = MF_CFG_RD(bp, func_mf_config[func].mac_upper);
 		val = MF_CFG_RD(bp, func_mf_config[func].mac_lower);
 		if ((val2 != FUNC_MF_CFG_UPPERMAC_DEFAULT) &&
-		    (val != FUNC_MF_CFG_LOWERMAC_DEFAULT))
-			bnx2x_set_mac_buf(bp->dev->dev_addr, val, val2);
+		    (val != FUNC_MF_CFG_LOWERMAC_DEFAULT)) {
+			bnx2x_set_mac_buf(addr, val, val2);
+			eth_hw_addr_set(bp->dev, addr);
+		}
 
 		if (CNIC_SUPPORT(bp))
 			bnx2x_get_cnic_mac_hwinfo(bp);
@@ -11854,7 +11858,8 @@ static void bnx2x_get_mac_hwinfo(struct bnx2x *bp)
 		/* in SF read MACs from port configuration */
 		val2 = SHMEM_RD(bp, dev_info.port_hw_config[port].mac_upper);
 		val = SHMEM_RD(bp, dev_info.port_hw_config[port].mac_lower);
-		bnx2x_set_mac_buf(bp->dev->dev_addr, val, val2);
+		bnx2x_set_mac_buf(addr, val, val2);
+		eth_hw_addr_set(bp->dev, addr);
 
 		if (CNIC_SUPPORT(bp))
 			bnx2x_get_cnic_mac_hwinfo(bp);
@@ -12302,7 +12307,9 @@ static int bnx2x_init_bp(struct bnx2x *bp)
 		if (rc)
 			return rc;
 	} else {
-		eth_zero_addr(bp->dev->dev_addr);
+		static const u8 zero_addr[ETH_ALEN] = {};
+
+		eth_hw_addr_set(bp->dev, zero_addr);
 	}
 
 	bnx2x_set_modes_bitmap(bp);
@@ -13031,27 +13038,6 @@ static const struct net_device_ops bnx2x_netdev_ops = {
 	.ndo_features_check	= bnx2x_features_check,
 };
 
-static int bnx2x_set_coherency_mask(struct bnx2x *bp)
-{
-	struct device *dev = &bp->pdev->dev;
-
-	if (dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64)) != 0 &&
-	    dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32)) != 0) {
-		dev_err(dev, "System does not support DMA, aborting\n");
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static void bnx2x_disable_pcie_error_reporting(struct bnx2x *bp)
-{
-	if (bp->flags & AER_ENABLED) {
-		pci_disable_pcie_error_reporting(bp->pdev);
-		bp->flags &= ~AER_ENABLED;
-	}
-}
-
 static int bnx2x_init_dev(struct bnx2x *bp, struct pci_dev *pdev,
 			  struct net_device *dev, unsigned long board_type)
 {
@@ -13121,9 +13107,11 @@ static int bnx2x_init_dev(struct bnx2x *bp, struct pci_dev *pdev,
 		goto err_out_release;
 	}
 
-	rc = bnx2x_set_coherency_mask(bp);
-	if (rc)
+	rc = dma_set_mask_and_coherent(&bp->pdev->dev, DMA_BIT_MASK(64));
+	if (rc) {
+		dev_err(&bp->pdev->dev, "System does not support DMA, aborting\n");
 		goto err_out_release;
+	}
 
 	dev->mem_start = pci_resource_start(pdev, 0);
 	dev->base_addr = dev->mem_start;
@@ -13161,13 +13149,6 @@ static int bnx2x_init_dev(struct bnx2x *bp, struct pci_dev *pdev,
 
 	/* Set PCIe reset type to fundamental for EEH recovery */
 	pdev->needs_freset = 1;
-
-	/* AER (Advanced Error reporting) configuration */
-	rc = pci_enable_pcie_error_reporting(pdev);
-	if (!rc)
-		bp->flags |= AER_ENABLED;
-	else
-		BNX2X_DEV_INFO("Failed To configure PCIe AER [%d]\n", rc);
 
 	/*
 	 * Clean the following indirect addresses for all functions since it
@@ -13676,19 +13657,20 @@ static int bnx2x_send_update_drift_ramrod(struct bnx2x *bp, int drift_dir,
 	return bnx2x_func_state_change(bp, &func_params);
 }
 
-static int bnx2x_ptp_adjfreq(struct ptp_clock_info *ptp, s32 ppb)
+static int bnx2x_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
 {
 	struct bnx2x *bp = container_of(ptp, struct bnx2x, ptp_clock_info);
 	int rc;
 	int drift_dir = 1;
 	int val, period, period1, period2, dif, dif1, dif2;
 	int best_dif = BNX2X_MAX_PHC_DRIFT, best_period = 0, best_val = 0;
+	s32 ppb = scaled_ppm_to_ppb(scaled_ppm);
 
-	DP(BNX2X_MSG_PTP, "PTP adjfreq called, ppb = %d\n", ppb);
+	DP(BNX2X_MSG_PTP, "PTP adjfine called, ppb = %d\n", ppb);
 
 	if (!netif_running(bp->dev)) {
 		DP(BNX2X_MSG_PTP,
-		   "PTP adjfreq called while the interface is down\n");
+		   "PTP adjfine called while the interface is down\n");
 		return -ENETDOWN;
 	}
 
@@ -13823,7 +13805,7 @@ void bnx2x_register_phc(struct bnx2x *bp)
 	bp->ptp_clock_info.n_ext_ts = 0;
 	bp->ptp_clock_info.n_per_out = 0;
 	bp->ptp_clock_info.pps = 0;
-	bp->ptp_clock_info.adjfreq = bnx2x_ptp_adjfreq;
+	bp->ptp_clock_info.adjfine = bnx2x_ptp_adjfine;
 	bp->ptp_clock_info.adjtime = bnx2x_ptp_adjtime;
 	bp->ptp_clock_info.gettime64 = bnx2x_ptp_gettime;
 	bp->ptp_clock_info.settime64 = bnx2x_ptp_settime;
@@ -14024,8 +14006,6 @@ init_one_freemem:
 	bnx2x_free_mem_bp(bp);
 
 init_one_exit:
-	bnx2x_disable_pcie_error_reporting(bp);
-
 	if (bp->regview)
 		iounmap(bp->regview);
 
@@ -14106,7 +14086,6 @@ static void __bnx2x_remove(struct pci_dev *pdev,
 		pci_set_power_state(pdev, PCI_D3hot);
 	}
 
-	bnx2x_disable_pcie_error_reporting(bp);
 	if (remove_netdev) {
 		if (bp->regview)
 			iounmap(bp->regview);
@@ -14160,7 +14139,7 @@ static int bnx2x_eeh_nic_unload(struct bnx2x *bp)
 	bnx2x_tx_disable(bp);
 	netdev_reset_tc(bp->dev);
 
-	del_timer_sync(&bp->timer);
+	timer_delete_sync(&bp->timer);
 	cancel_delayed_work_sync(&bp->sp_task);
 	cancel_delayed_work_sync(&bp->period_task);
 
@@ -14237,7 +14216,6 @@ static pci_ers_result_t bnx2x_io_slot_reset(struct pci_dev *pdev)
 
 	pci_set_master(pdev);
 	pci_restore_state(pdev);
-	pci_save_state(pdev);
 
 	if (netif_running(dev))
 		bnx2x_set_power_state(bp, PCI_D0);
@@ -14261,13 +14239,16 @@ static pci_ers_result_t bnx2x_io_slot_reset(struct pci_dev *pdev)
 		}
 		bnx2x_drain_tx_queues(bp);
 		bnx2x_send_unload_req(bp, UNLOAD_RECOVERY);
-		bnx2x_netif_stop(bp, 1);
-		bnx2x_del_all_napi(bp);
+		if (!bp->nic_stopped) {
+			bnx2x_netif_stop(bp, 1);
+			bnx2x_del_all_napi(bp);
 
-		if (CNIC_LOADED(bp))
-			bnx2x_del_all_napi_cnic(bp);
+			if (CNIC_LOADED(bp))
+				bnx2x_del_all_napi_cnic(bp);
 
-		bnx2x_free_irq(bp);
+			bnx2x_free_irq(bp);
+			bp->nic_stopped = true;
+		}
 
 		/* Report UNLOAD_DONE to MCP */
 		bnx2x_send_unload_done(bp, true);
@@ -14929,9 +14910,11 @@ void bnx2x_setup_cnic_irq_info(struct bnx2x *bp)
 	else
 		cp->irq_arr[0].status_blk = (void *)bp->cnic_sb.e1x_sb;
 
+	cp->irq_arr[0].status_blk_map = bp->cnic_sb_mapping;
 	cp->irq_arr[0].status_blk_num =  bnx2x_cnic_fw_sb_id(bp);
 	cp->irq_arr[0].status_blk_num2 = bnx2x_cnic_igu_sb_id(bp);
 	cp->irq_arr[1].status_blk = bp->def_status_blk;
+	cp->irq_arr[1].status_blk_map = bp->def_status_blk_mapping;
 	cp->irq_arr[1].status_blk_num = DEF_SB_ID;
 	cp->irq_arr[1].status_blk_num2 = DEF_SB_IGU_ID;
 
@@ -15191,7 +15174,7 @@ void bnx2x_set_rx_ts(struct bnx2x *bp, struct sk_buff *skb)
 }
 
 /* Read the PHC */
-static u64 bnx2x_cyclecounter_read(const struct cyclecounter *cc)
+static u64 bnx2x_cyclecounter_read(struct cyclecounter *cc)
 {
 	struct bnx2x *bp = container_of(cc, struct bnx2x, cyclecounter);
 	int port = BP_PORT(bp);
@@ -15378,11 +15361,6 @@ static int bnx2x_hwtstamp_ioctl(struct bnx2x *bp, struct ifreq *ifr)
 
 	DP(BNX2X_MSG_PTP, "Requested tx_type: %d, requested rx_filters = %d\n",
 	   config.tx_type, config.rx_filter);
-
-	if (config.flags) {
-		BNX2X_ERR("config.flags is reserved for future use\n");
-		return -EINVAL;
-	}
 
 	bp->hwtstamp_ioctl_called = true;
 	bp->tx_type = config.tx_type;

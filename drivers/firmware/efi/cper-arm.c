@@ -12,7 +12,6 @@
 #include <linux/dmi.h>
 #include <linux/acpi.h>
 #include <linux/pci.h>
-#include <linux/aer.h>
 #include <linux/printk.h>
 #include <linux/bcd.h>
 #include <acpi/ghes.h>
@@ -227,7 +226,8 @@ static void cper_print_arm_err_info(const char *pfx, u32 type,
 }
 
 void cper_print_proc_arm(const char *pfx,
-			 const struct cper_sec_proc_arm *proc)
+			 const struct cper_sec_proc_arm *proc,
+			 u32 length)
 {
 	int i, len, max_ctx_type;
 	struct cper_arm_err_info *err_info;
@@ -239,9 +239,12 @@ void cper_print_proc_arm(const char *pfx,
 
 	len = proc->section_length - (sizeof(*proc) +
 		proc->err_info_num * (sizeof(*err_info)));
-	if (len < 0) {
-		printk("%ssection length: %d\n", pfx, proc->section_length);
-		printk("%ssection length is too small\n", pfx);
+
+	if (len < 0 || proc->section_length > length) {
+		printk("%ssection length: %d, CPER size: %d\n",
+		       pfx, proc->section_length, length);
+		printk("%ssection length is too %s\n", pfx,
+		       (len < 0) ? "small" : "big");
 		printk("%sfirmware-generated error record is incorrect\n", pfx);
 		printk("%sERR_INFO_NUM is %d\n", pfx, proc->err_info_num);
 		return;
@@ -310,7 +313,7 @@ void cper_print_proc_arm(const char *pfx,
 	ctx_info = (struct cper_arm_ctx_info *)err_info;
 	max_ctx_type = ARRAY_SIZE(arm_reg_ctx_strs) - 1;
 	for (i = 0; i < proc->context_info_num; i++) {
-		int size = sizeof(*ctx_info) + ctx_info->size;
+		int size = ALIGN(sizeof(*ctx_info) + ctx_info->size, 16);
 
 		printk("%sContext info structure %d:\n", pfx, i);
 		if (len < size) {

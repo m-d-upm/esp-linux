@@ -8,8 +8,7 @@
 #include <linux/module.h>
 #include <linux/interrupt.h>
 #include <linux/delay.h>
-#include <linux/of_irq.h>
-#include <linux/of_device.h>
+#include <linux/of.h>
 #include <linux/pm_runtime.h>
 #include <linux/power_supply.h>
 #include <linux/i2c.h>
@@ -1580,11 +1579,10 @@ static const struct regmap_config rt9455_regmap_config = {
 	.writeable_reg	= rt9455_is_writeable_reg,
 	.volatile_reg	= rt9455_is_volatile_reg,
 	.max_register	= RT9455_REG_MASK3,
-	.cache_type	= REGCACHE_RBTREE,
+	.cache_type	= REGCACHE_MAPLE,
 };
 
-static int rt9455_probe(struct i2c_client *client,
-			const struct i2c_device_id *id)
+static int rt9455_probe(struct i2c_client *client)
 {
 	struct i2c_adapter *adapter = client->adapter;
 	struct device *dev = &client->dev;
@@ -1660,11 +1658,20 @@ static int rt9455_probe(struct i2c_client *client,
 	INIT_DEFERRABLE_WORK(&info->batt_presence_work,
 			     rt9455_batt_presence_work_callback);
 
-	rt9455_charger_config.of_node		= dev->of_node;
+	rt9455_charger_config.fwnode		= dev_fwnode(dev);
 	rt9455_charger_config.drv_data		= info;
 	rt9455_charger_config.supplied_to	= rt9455_charger_supplied_to;
 	rt9455_charger_config.num_supplicants	=
 					ARRAY_SIZE(rt9455_charger_supplied_to);
+
+	info->charger = devm_power_supply_register(dev, &rt9455_charger_desc,
+						   &rt9455_charger_config);
+	if (IS_ERR(info->charger)) {
+		dev_err(dev, "Failed to register charger\n");
+		ret = PTR_ERR(info->charger);
+		goto put_usb_notifier;
+	}
+
 	ret = devm_request_threaded_irq(dev, client->irq, NULL,
 					rt9455_irq_handler_thread,
 					IRQF_TRIGGER_LOW | IRQF_ONESHOT,
@@ -1680,14 +1687,6 @@ static int rt9455_probe(struct i2c_client *client,
 		goto put_usb_notifier;
 	}
 
-	info->charger = devm_power_supply_register(dev, &rt9455_charger_desc,
-						   &rt9455_charger_config);
-	if (IS_ERR(info->charger)) {
-		dev_err(dev, "Failed to register charger\n");
-		ret = PTR_ERR(info->charger);
-		goto put_usb_notifier;
-	}
-
 	return 0;
 
 put_usb_notifier:
@@ -1700,7 +1699,7 @@ put_usb_notifier:
 	return ret;
 }
 
-static int rt9455_remove(struct i2c_client *client)
+static void rt9455_remove(struct i2c_client *client)
 {
 	int ret;
 	struct rt9455_info *info = i2c_get_clientdata(client);
@@ -1717,17 +1716,15 @@ static int rt9455_remove(struct i2c_client *client)
 	cancel_delayed_work_sync(&info->pwr_rdy_work);
 	cancel_delayed_work_sync(&info->max_charging_time_work);
 	cancel_delayed_work_sync(&info->batt_presence_work);
-
-	return ret;
 }
 
 static const struct i2c_device_id rt9455_i2c_id_table[] = {
-	{ RT9455_DRIVER_NAME, 0 },
-	{ },
+	{ RT9455_DRIVER_NAME },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, rt9455_i2c_id_table);
 
-static const struct of_device_id rt9455_of_match[] = {
+static const struct of_device_id rt9455_of_match[] __maybe_unused = {
 	{ .compatible = "richtek,rt9455", },
 	{ },
 };

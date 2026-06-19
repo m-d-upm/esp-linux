@@ -170,11 +170,9 @@ static int __init tc1100_probe(struct platform_device *device)
 }
 
 
-static int tc1100_remove(struct platform_device *device)
+static void tc1100_remove(struct platform_device *device)
 {
 	sysfs_remove_group(&device->dev.kobj, &tc1100_attribute_group);
-
-	return 0;
 }
 
 #ifdef CONFIG_PM
@@ -233,7 +231,7 @@ static int __init tc1100_init(void)
 	if (!wmi_has_guid(GUID))
 		return -ENODEV;
 
-	tc1100_device = platform_device_alloc("tc1100-wmi", -1);
+	tc1100_device = platform_device_alloc("tc1100-wmi", PLATFORM_DEVID_NONE);
 	if (!tc1100_device)
 		return -ENOMEM;
 

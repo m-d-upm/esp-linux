@@ -27,7 +27,7 @@ static DEFINE_MUTEX(gov_dbs_data_mutex);
 
 /* Common sysfs tunables */
 /*
- * store_sampling_rate - update sampling rate effective immediately if needed.
+ * sampling_rate_store - update sampling rate effective immediately if needed.
  *
  * If new rate is smaller than the old, simply updating
  * dbs.sampling_rate might not be appropriate. For example, if the
@@ -41,7 +41,7 @@ static DEFINE_MUTEX(gov_dbs_data_mutex);
  * This must be called with dbs_data->mutex held, otherwise traversing
  * policy_dbs_list isn't safe.
  */
-ssize_t store_sampling_rate(struct gov_attr_set *attr_set, const char *buf,
+ssize_t sampling_rate_store(struct gov_attr_set *attr_set, const char *buf,
 			    size_t count)
 {
 	struct dbs_data *dbs_data = to_dbs_data(attr_set);
@@ -80,7 +80,7 @@ ssize_t store_sampling_rate(struct gov_attr_set *attr_set, const char *buf,
 
 	return count;
 }
-EXPORT_SYMBOL_GPL(store_sampling_rate);
+EXPORT_SYMBOL_GPL(sampling_rate_store);
 
 /**
  * gov_update_cpu_data - Update CPU load data.
@@ -440,7 +440,7 @@ int cpufreq_dbs_governor_init(struct cpufreq_policy *policy)
 
 	ret = gov->init(dbs_data);
 	if (ret)
-		goto free_policy_dbs_info;
+		goto free_dbs_data;
 
 	/*
 	 * The sampling interval should not be less than the transition latency
@@ -468,13 +468,15 @@ int cpufreq_dbs_governor_init(struct cpufreq_policy *policy)
 	/* Failure, so roll back. */
 	pr_err("initialization failed (dbs_data kobject init error %d)\n", ret);
 
-	kobject_put(&dbs_data->attr_set.kobj);
-
 	policy->governor_data = NULL;
 
 	if (!have_governor_per_policy())
 		gov->gdbs_data = NULL;
-	gov->exit(dbs_data);
+
+	kobject_put(&dbs_data->attr_set.kobj);
+	goto free_policy_dbs_info;
+
+free_dbs_data:
 	kfree(dbs_data);
 
 free_policy_dbs_info:
@@ -561,6 +563,7 @@ EXPORT_SYMBOL_GPL(cpufreq_dbs_governor_stop);
 
 void cpufreq_dbs_governor_limits(struct cpufreq_policy *policy)
 {
+	struct dbs_governor *gov = dbs_governor_of(policy);
 	struct policy_dbs_info *policy_dbs;
 
 	/* Protect gov->gdbs_data against cpufreq_dbs_governor_exit() */
@@ -572,6 +575,8 @@ void cpufreq_dbs_governor_limits(struct cpufreq_policy *policy)
 	mutex_lock(&policy_dbs->update_mutex);
 	cpufreq_policy_apply_limits(policy);
 	gov_update_sample_delay(policy_dbs, 0);
+	if (gov->limits)
+		gov->limits(policy);
 	mutex_unlock(&policy_dbs->update_mutex);
 
 out:

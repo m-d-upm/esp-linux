@@ -4,25 +4,17 @@
  * Copyright (C) 2008-2009 Wolfgang Grandegger <wg@grandegger.com>
  */
 
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/slab.h>
-#include <linux/netdevice.h>
-#include <linux/if_arp.h>
-#include <linux/workqueue.h>
 #include <linux/can.h>
 #include <linux/can/can-ml.h>
 #include <linux/can/dev.h>
 #include <linux/can/skb.h>
-#include <linux/can/led.h>
 #include <linux/gpio/consumer.h>
+#include <linux/if_arp.h>
+#include <linux/kernel.h>
+#include <linux/netdevice.h>
 #include <linux/of.h>
-
-#define MOD_DESC "CAN device driver interface"
-
-MODULE_DESCRIPTION(MOD_DESC);
-MODULE_LICENSE("GPL v2");
-MODULE_AUTHOR("Wolfgang Grandegger <wg@grandegger.com>");
+#include <linux/slab.h>
+#include <linux/workqueue.h>
 
 static void can_update_state_error_stats(struct net_device *dev,
 					 enum can_state new_state)
@@ -93,10 +85,63 @@ const char *can_get_state_str(const enum can_state state)
 	default:
 		return "<unknown>";
 	}
-
-	return "<unknown>";
 }
 EXPORT_SYMBOL_GPL(can_get_state_str);
+
+const char *can_get_ctrlmode_str(u32 ctrlmode)
+{
+	switch (ctrlmode & ~(ctrlmode - 1)) {
+	case 0:
+		return "none";
+	case CAN_CTRLMODE_LOOPBACK:
+		return "loopback";
+	case CAN_CTRLMODE_LISTENONLY:
+		return "listen-only";
+	case CAN_CTRLMODE_3_SAMPLES:
+		return "triple-sampling";
+	case CAN_CTRLMODE_ONE_SHOT:
+		return "one-shot";
+	case CAN_CTRLMODE_BERR_REPORTING:
+		return "berr-reporting";
+	case CAN_CTRLMODE_FD:
+		return "fd";
+	case CAN_CTRLMODE_PRESUME_ACK:
+		return "presume-ack";
+	case CAN_CTRLMODE_FD_NON_ISO:
+		return "fd-non-iso";
+	case CAN_CTRLMODE_CC_LEN8_DLC:
+		return "cc-len8-dlc";
+	case CAN_CTRLMODE_TDC_AUTO:
+		return "fd-tdc-auto";
+	case CAN_CTRLMODE_TDC_MANUAL:
+		return "fd-tdc-manual";
+	default:
+		return "<unknown>";
+	}
+}
+EXPORT_SYMBOL_GPL(can_get_ctrlmode_str);
+
+static enum can_state can_state_err_to_state(u16 err)
+{
+	if (err < CAN_ERROR_WARNING_THRESHOLD)
+		return CAN_STATE_ERROR_ACTIVE;
+	if (err < CAN_ERROR_PASSIVE_THRESHOLD)
+		return CAN_STATE_ERROR_WARNING;
+	if (err < CAN_BUS_OFF_THRESHOLD)
+		return CAN_STATE_ERROR_PASSIVE;
+
+	return CAN_STATE_BUS_OFF;
+}
+
+void can_state_get_by_berr_counter(const struct net_device *dev,
+				   const struct can_berr_counter *bec,
+				   enum can_state *tx_state,
+				   enum can_state *rx_state)
+{
+	*tx_state = can_state_err_to_state(bec->txerr);
+	*rx_state = can_state_err_to_state(bec->rxerr);
+}
+EXPORT_SYMBOL_GPL(can_state_get_by_berr_counter);
 
 void can_change_state(struct net_device *dev, struct can_frame *cf,
 		      enum can_state tx_state, enum can_state rx_state)
@@ -133,12 +178,15 @@ void can_change_state(struct net_device *dev, struct can_frame *cf,
 EXPORT_SYMBOL_GPL(can_change_state);
 
 /* CAN device restart for bus-off recovery */
-static void can_restart(struct net_device *dev)
+static int can_restart(struct net_device *dev)
 {
 	struct can_priv *priv = netdev_priv(dev);
 	struct sk_buff *skb;
 	struct can_frame *cf;
 	int err;
+
+	if (!priv->do_set_mode)
+		return -EOPNOTSUPP;
 
 	if (netif_carrier_ok(dev))
 		netdev_err(dev, "Attempt to restart for bus-off recovery, but carrier is OK?\n");
@@ -150,24 +198,25 @@ static void can_restart(struct net_device *dev)
 
 	/* send restart message upstream */
 	skb = alloc_can_err_skb(dev, &cf);
-	if (!skb)
-		goto restart;
-
-	cf->can_id |= CAN_ERR_RESTARTED;
-
-	netif_rx_ni(skb);
-
-restart:
-	netdev_dbg(dev, "restarted\n");
-	priv->can_stats.restarts++;
+	if (skb) {
+		cf->can_id |= CAN_ERR_RESTARTED;
+		netif_rx(skb);
+	}
 
 	/* Now restart the device */
 	netif_carrier_on(dev);
 	err = priv->do_set_mode(dev, CAN_MODE_START);
 	if (err) {
-		netdev_err(dev, "Error %d during restart", err);
+		netdev_err(dev, "Restart failed, error %pe\n", ERR_PTR(err));
 		netif_carrier_off(dev);
+
+		return err;
+	} else {
+		netdev_dbg(dev, "Restarted\n");
+		priv->can_stats.restarts++;
 	}
+
+	return 0;
 }
 
 static void can_restart_work(struct work_struct *work)
@@ -192,9 +241,8 @@ int can_restart_now(struct net_device *dev)
 		return -EBUSY;
 
 	cancel_delayed_work_sync(&priv->restart_work);
-	can_restart(dev);
 
-	return 0;
+	return can_restart(dev);
 }
 
 /* CAN bus-off
@@ -225,6 +273,8 @@ void can_setup(struct net_device *dev)
 {
 	dev->type = ARPHRD_CAN;
 	dev->mtu = CAN_MTU;
+	dev->min_mtu = CAN_MTU;
+	dev->max_mtu = CAN_MTU;
 	dev->hard_header_len = 0;
 	dev->addr_len = 0;
 	dev->tx_queue_len = 10;
@@ -294,10 +344,26 @@ void free_candev(struct net_device *dev)
 }
 EXPORT_SYMBOL_GPL(free_candev);
 
+void can_set_default_mtu(struct net_device *dev)
+{
+	struct can_priv *priv = netdev_priv(dev);
+
+	if (priv->ctrlmode & CAN_CTRLMODE_FD) {
+		dev->mtu = CANFD_MTU;
+		dev->min_mtu = CANFD_MTU;
+		dev->max_mtu = CANFD_MTU;
+	} else {
+		dev->mtu = CAN_MTU;
+		dev->min_mtu = CAN_MTU;
+		dev->max_mtu = CAN_MTU;
+	}
+}
+
 /* changing MTU and control mode for CAN/CANFD devices */
 int can_change_mtu(struct net_device *dev, int new_mtu)
 {
 	struct can_priv *priv = netdev_priv(dev);
+	u32 ctrlmode_static = can_get_static_ctrlmode(priv);
 
 	/* Do not allow changing the MTU while running */
 	if (dev->flags & IFF_UP)
@@ -307,7 +373,7 @@ int can_change_mtu(struct net_device *dev, int new_mtu)
 	switch (new_mtu) {
 	case CAN_MTU:
 		/* 'CANFD-only' controllers can not switch to CAN_MTU */
-		if (priv->ctrlmode_static & CAN_CTRLMODE_FD)
+		if (ctrlmode_static & CAN_CTRLMODE_FD)
 			return -EINVAL;
 
 		priv->ctrlmode &= ~CAN_CTRLMODE_FD;
@@ -316,7 +382,7 @@ int can_change_mtu(struct net_device *dev, int new_mtu)
 	case CANFD_MTU:
 		/* check for potential CANFD ability */
 		if (!(priv->ctrlmode_supported & CAN_CTRLMODE_FD) &&
-		    !(priv->ctrlmode_static & CAN_CTRLMODE_FD))
+		    !(ctrlmode_static & CAN_CTRLMODE_FD))
 			return -EINVAL;
 
 		priv->ctrlmode |= CAN_CTRLMODE_FD;
@@ -326,10 +392,30 @@ int can_change_mtu(struct net_device *dev, int new_mtu)
 		return -EINVAL;
 	}
 
-	dev->mtu = new_mtu;
+	WRITE_ONCE(dev->mtu, new_mtu);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(can_change_mtu);
+
+/* helper to define static CAN controller features at device creation time */
+int can_set_static_ctrlmode(struct net_device *dev, u32 static_mode)
+{
+	struct can_priv *priv = netdev_priv(dev);
+
+	/* alloc_candev() succeeded => netdev_priv() is valid at this point */
+	if (priv->ctrlmode_supported & static_mode) {
+		netdev_warn(dev,
+			    "Controller features can not be supported and static at the same time\n");
+		return -EINVAL;
+	}
+	priv->ctrlmode = static_mode;
+
+	/* override MTU which was set by default in can_setup()? */
+	can_set_default_mtu(dev);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(can_set_static_ctrlmode);
 
 /* generic implementation of netdev_ops::ndo_eth_ioctl for CAN devices
  * supporting hardware timestamps
@@ -364,16 +450,13 @@ EXPORT_SYMBOL(can_eth_ioctl_hwts);
  * supporting hardware timestamps
  */
 int can_ethtool_op_get_ts_info_hwts(struct net_device *dev,
-				    struct ethtool_ts_info *info)
+				    struct kernel_ethtool_ts_info *info)
 {
 	info->so_timestamping =
 		SOF_TIMESTAMPING_TX_SOFTWARE |
-		SOF_TIMESTAMPING_RX_SOFTWARE |
-		SOF_TIMESTAMPING_SOFTWARE |
 		SOF_TIMESTAMPING_TX_HARDWARE |
 		SOF_TIMESTAMPING_RX_HARDWARE |
 		SOF_TIMESTAMPING_RAW_HARDWARE;
-	info->phc_index = -1;
 	info->tx_types = BIT(HWTSTAMP_TX_ON);
 	info->rx_filters = BIT(HWTSTAMP_FILTER_ALL);
 
@@ -397,8 +480,8 @@ int open_candev(struct net_device *dev)
 
 	/* For CAN FD the data bitrate has to be >= the arbitration bitrate */
 	if ((priv->ctrlmode & CAN_CTRLMODE_FD) &&
-	    (!priv->data_bittiming.bitrate ||
-	     priv->data_bittiming.bitrate < priv->bittiming.bitrate)) {
+	    (!priv->fd.data_bittiming.bitrate ||
+	     priv->fd.data_bittiming.bitrate < priv->bittiming.bitrate)) {
 		netdev_err(dev, "incorrect/missing data bit-timing\n");
 		return -EINVAL;
 	}
@@ -507,6 +590,18 @@ static int can_get_termination(struct net_device *ndev)
 	return 0;
 }
 
+static bool
+can_bittiming_const_valid(const struct can_bittiming_const *btc)
+{
+	if (!btc)
+		return true;
+
+	if (!btc->sjw_max)
+		return false;
+
+	return true;
+}
+
 /* Register the CAN network device */
 int register_candev(struct net_device *dev)
 {
@@ -524,7 +619,16 @@ int register_candev(struct net_device *dev)
 	if (!priv->bitrate_const != !priv->bitrate_const_cnt)
 		return -EINVAL;
 
-	if (!priv->data_bitrate_const != !priv->data_bitrate_const_cnt)
+	if (!priv->fd.data_bitrate_const != !priv->fd.data_bitrate_const_cnt)
+		return -EINVAL;
+
+	/* We only support either fixed bit rates or bit timing const. */
+	if ((priv->bitrate_const || priv->fd.data_bitrate_const) &&
+	    (priv->bittiming_const || priv->fd.data_bittiming_const))
+		return -EINVAL;
+
+	if (!can_bittiming_const_valid(priv->bittiming_const) ||
+	    !can_bittiming_const_valid(priv->fd.data_bittiming_const))
 		return -EINVAL;
 
 	if (!priv->termination_const) {
@@ -563,11 +667,9 @@ static __init int can_dev_init(void)
 {
 	int err;
 
-	can_led_notifier_init();
-
 	err = can_netlink_register();
 	if (!err)
-		pr_info(MOD_DESC "\n");
+		pr_info("CAN device driver interface\n");
 
 	return err;
 }
@@ -576,8 +678,6 @@ module_init(can_dev_init);
 static __exit void can_dev_exit(void)
 {
 	can_netlink_unregister();
-
-	can_led_notifier_exit();
 }
 module_exit(can_dev_exit);
 

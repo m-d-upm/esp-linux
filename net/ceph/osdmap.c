@@ -11,6 +11,22 @@
 #include <linux/crush/hash.h>
 #include <linux/crush/mapper.h>
 
+static __printf(2, 3)
+void osdmap_info(const struct ceph_osdmap *map, const char *fmt, ...)
+{
+	struct va_format vaf;
+	va_list args;
+
+	va_start(args, fmt);
+	vaf.fmt = fmt;
+	vaf.va = &args;
+
+	printk(KERN_INFO "%s (%pU e%u): %pV", KBUILD_MODNAME, &map->fsid,
+	       map->epoch, &vaf);
+
+	va_end(args);
+}
+
 char *ceph_osdmap_state_str(char *str, int len, u32 state)
 {
 	if (!len)
@@ -374,11 +390,15 @@ static int decode_choose_args(void **p, void *end, struct crush_map *c)
 				goto fail;
 
 			if (arg->ids_size &&
-			    arg->ids_size != c->buckets[bucket_index]->size)
+			    (!c->buckets[bucket_index] ||
+			     arg->ids_size != c->buckets[bucket_index]->size))
 				goto e_inval;
 		}
 
-		insert_choose_arg_map(&c->choose_args, arg_map);
+		if (!__insert_choose_arg_map(&c->choose_args, arg_map)) {
+			ret = -EEXIST;
+			goto fail;
+		}
 	}
 
 	return 0;
@@ -501,6 +521,10 @@ static struct crush_map *crush_decode(void *pbyval, void *end)
 		b->id = ceph_decode_32(p);
 		b->type = ceph_decode_16(p);
 		b->alg = ceph_decode_8(p);
+		if (b->alg != alg) {
+			b->alg = 0;
+			goto bad;
+		}
 		b->hash = ceph_decode_8(p);
 		b->weight = ceph_decode_32(p);
 		b->size = ceph_decode_32(p);
@@ -575,10 +599,10 @@ static struct crush_map *crush_decode(void *pbyval, void *end)
 			goto bad;
 #endif
 		r = kmalloc(struct_size(r, steps, yes), GFP_NOFS);
-		c->rules[i] = r;
 		if (r == NULL)
 			goto badmem;
 		dout(" rule %d is at %p\n", i, r);
+		c->rules[i] = r;
 		r->len = yes;
 		ceph_decode_copy_safe(p, end, &r->mask, 4, bad); /* 4 u8's */
 		ceph_decode_need(p, end, r->len*3*sizeof(u32), bad);
@@ -972,7 +996,7 @@ static struct crush_work *alloc_workspace(const struct crush_map *c)
 	work_size = crush_work_size(c, CEPH_PG_MAX_SIZE);
 	dout("%s work_size %zu bytes\n", __func__, work_size);
 
-	work = ceph_kvmalloc(work_size, GFP_NOIO);
+	work = kvmalloc(work_size, GFP_NOIO);
 	if (!work)
 		return NULL;
 
@@ -1182,9 +1206,9 @@ static int osdmap_set_max_osd(struct ceph_osdmap *map, u32 max)
 	if (max == map->max_osd)
 		return 0;
 
-	state = ceph_kvmalloc(array_size(max, sizeof(*state)), GFP_NOFS);
-	weight = ceph_kvmalloc(array_size(max, sizeof(*weight)), GFP_NOFS);
-	addr = ceph_kvmalloc(array_size(max, sizeof(*addr)), GFP_NOFS);
+	state = kvmalloc(array_size(max, sizeof(*state)), GFP_NOFS);
+	weight = kvmalloc(array_size(max, sizeof(*weight)), GFP_NOFS);
+	addr = kvmalloc(array_size(max, sizeof(*addr)), GFP_NOFS);
 	if (!state || !weight || !addr) {
 		kvfree(state);
 		kvfree(weight);
@@ -1214,7 +1238,7 @@ static int osdmap_set_max_osd(struct ceph_osdmap *map, u32 max)
 	if (map->osd_primary_affinity) {
 		u32 *affinity;
 
-		affinity = ceph_kvmalloc(array_size(max, sizeof(*affinity)),
+		affinity = kvmalloc(array_size(max, sizeof(*affinity)),
 					 GFP_NOFS);
 		if (!affinity)
 			return -ENOMEM;
@@ -1480,8 +1504,6 @@ static int decode_new_primary_temp(void **p, void *end,
 
 u32 ceph_get_primary_affinity(struct ceph_osdmap *map, int osd)
 {
-	BUG_ON(osd >= map->max_osd);
-
 	if (!map->osd_primary_affinity)
 		return CEPH_OSD_DEFAULT_PRIMARY_AFFINITY;
 
@@ -1490,12 +1512,10 @@ u32 ceph_get_primary_affinity(struct ceph_osdmap *map, int osd)
 
 static int set_primary_affinity(struct ceph_osdmap *map, int osd, u32 aff)
 {
-	BUG_ON(osd >= map->max_osd);
-
 	if (!map->osd_primary_affinity) {
 		int i;
 
-		map->osd_primary_affinity = ceph_kvmalloc(
+		map->osd_primary_affinity = kvmalloc(
 		    array_size(map->max_osd, sizeof(*map->osd_primary_affinity)),
 		    GFP_NOFS);
 		if (!map->osd_primary_affinity)
@@ -1553,12 +1573,14 @@ static int decode_new_primary_affinity(void **p, void *end,
 
 		ceph_decode_32_safe(p, end, osd, e_inval);
 		ceph_decode_32_safe(p, end, aff, e_inval);
+		if (osd >= map->max_osd)
+			goto e_inval;
 
 		ret = set_primary_affinity(map, osd, aff);
 		if (ret)
 			return ret;
 
-		pr_info("osd%d primary-affinity 0x%x\n", osd, aff);
+		osdmap_info(map, "osd%d primary-affinity 0x%x\n", osd, aff);
 	}
 
 	return 0;
@@ -1689,7 +1711,7 @@ static int osdmap_decode(void **p, void *end, bool msgr2,
 	ceph_decode_need(p, end, 3*sizeof(u32) +
 			 map->max_osd*(struct_v >= 5 ? sizeof(u32) :
 						       sizeof(u8)) +
-				       sizeof(*map->osd_weight), e_inval);
+			 map->max_osd*sizeof(*map->osd_weight), e_inval);
 	if (ceph_decode_32(p) != map->max_osd)
 		goto e_inval;
 
@@ -1855,10 +1877,12 @@ static int decode_new_up_state_weight(void **p, void *end, u8 struct_v,
 		ceph_decode_need(p, end, 2*sizeof(u32), e_inval);
 		osd = ceph_decode_32(p);
 		w = ceph_decode_32(p);
-		BUG_ON(osd >= map->max_osd);
-		pr_info("osd%d weight 0x%x %s\n", osd, w,
-		     w == CEPH_OSD_IN ? "(in)" :
-		     (w == CEPH_OSD_OUT ? "(out)" : ""));
+		if (osd >= map->max_osd)
+			goto e_inval;
+
+		osdmap_info(map, "osd%d weight 0x%x %s\n", osd, w,
+			    w == CEPH_OSD_IN ? "(in)" :
+			    (w == CEPH_OSD_OUT ? "(out)" : ""));
 		map->osd_weight[osd] = w;
 
 		/*
@@ -1881,19 +1905,21 @@ static int decode_new_up_state_weight(void **p, void *end, u8 struct_v,
 		u32 xorstate;
 
 		osd = ceph_decode_32(p);
+		if (osd >= map->max_osd)
+			goto e_inval;
+
 		if (struct_v >= 5)
 			xorstate = ceph_decode_32(p);
 		else
 			xorstate = ceph_decode_8(p);
 		if (xorstate == 0)
 			xorstate = CEPH_OSD_UP;
-		BUG_ON(osd >= map->max_osd);
 		if ((map->osd_state[osd] & CEPH_OSD_UP) &&
 		    (xorstate & CEPH_OSD_UP))
-			pr_info("osd%d down\n", osd);
+			osdmap_info(map, "osd%d down\n", osd);
 		if ((map->osd_state[osd] & CEPH_OSD_EXISTS) &&
 		    (xorstate & CEPH_OSD_EXISTS)) {
-			pr_info("osd%d does not exist\n", osd);
+			osdmap_info(map, "osd%d does not exist\n", osd);
 			ret = set_primary_affinity(map, osd,
 						   CEPH_OSD_DEFAULT_PRIMARY_AFFINITY);
 			if (ret)
@@ -1913,7 +1939,9 @@ static int decode_new_up_state_weight(void **p, void *end, u8 struct_v,
 		struct ceph_entity_addr addr;
 
 		osd = ceph_decode_32(p);
-		BUG_ON(osd >= map->max_osd);
+		if (osd >= map->max_osd)
+			goto e_inval;
+
 		if (struct_v >= 7)
 			ret = ceph_decode_entity_addrvec(p, end, msgr2, &addr);
 		else
@@ -1923,7 +1951,7 @@ static int decode_new_up_state_weight(void **p, void *end, u8 struct_v,
 
 		dout("%s osd%d addr %s\n", __func__, osd, ceph_pr_addr(&addr));
 
-		pr_info("osd%d up\n", osd);
+		osdmap_info(map, "osd%d up\n", osd);
 		map->osd_state[osd] |= CEPH_OSD_EXISTS | CEPH_OSD_UP;
 		map->osd_addr[osd] = addr;
 	}

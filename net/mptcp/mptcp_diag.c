@@ -10,15 +10,14 @@
 #include <linux/net.h>
 #include <linux/inet_diag.h>
 #include <net/netlink.h>
-#include <uapi/linux/mptcp.h>
 #include "protocol.h"
 
 static int sk_diag_dump(struct sock *sk, struct sk_buff *skb,
 			struct netlink_callback *cb,
 			const struct inet_diag_req_v2 *req,
-			struct nlattr *bc, bool net_admin)
+			bool net_admin)
 {
-	if (!inet_diag_bc_sk(bc, sk))
+	if (!inet_diag_bc_sk(cb->data, sk))
 		return 0;
 
 	return inet_sk_diag_fill(sk, inet_csk(sk), skb, cb, req, NLM_F_MULTI,
@@ -77,19 +76,20 @@ static void mptcp_diag_dump_listeners(struct sk_buff *skb, struct netlink_callba
 				      const struct inet_diag_req_v2 *r,
 				      bool net_admin)
 {
-	struct inet_diag_dump_data *cb_data = cb->data;
 	struct mptcp_diag_ctx *diag_ctx = (void *)cb->ctx;
-	struct nlattr *bc = cb_data->inet_diag_nla_bc;
 	struct net *net = sock_net(skb->sk);
+	struct inet_hashinfo *hinfo;
 	int i;
 
-	for (i = diag_ctx->l_slot; i <= tcp_hashinfo.lhash2_mask; i++) {
+	hinfo = net->ipv4.tcp_death_row.hashinfo;
+
+	for (i = diag_ctx->l_slot; i <= hinfo->lhash2_mask; i++) {
 		struct inet_listen_hashbucket *ilb;
 		struct hlist_nulls_node *node;
 		struct sock *sk;
 		int num = 0;
 
-		ilb = &tcp_hashinfo.lhash2[i];
+		ilb = &hinfo->lhash2[i];
 
 		rcu_read_lock();
 		spin_lock(&ilb->lock);
@@ -119,7 +119,7 @@ static void mptcp_diag_dump_listeners(struct sk_buff *skb, struct netlink_callba
 			if (!refcount_inc_not_zero(&sk->sk_refcnt))
 				goto next_listen;
 
-			ret = sk_diag_dump(sk, skb, cb, r, bc, net_admin);
+			ret = sk_diag_dump(sk, skb, cb, r, net_admin);
 
 			sock_put(sk);
 
@@ -152,14 +152,9 @@ static void mptcp_diag_dump(struct sk_buff *skb, struct netlink_callback *cb,
 	bool net_admin = netlink_net_capable(cb->skb, CAP_NET_ADMIN);
 	struct mptcp_diag_ctx *diag_ctx = (void *)cb->ctx;
 	struct net *net = sock_net(skb->sk);
-	struct inet_diag_dump_data *cb_data;
 	struct mptcp_sock *msk;
-	struct nlattr *bc;
 
 	BUILD_BUG_ON(sizeof(cb->ctx) < sizeof(*diag_ctx));
-
-	cb_data = cb->data;
-	bc = cb_data->inet_diag_nla_bc;
 
 	while ((msk = mptcp_token_iter_next(net, &diag_ctx->s_slot,
 					    &diag_ctx->s_num)) != NULL) {
@@ -179,7 +174,7 @@ static void mptcp_diag_dump(struct sk_buff *skb, struct netlink_callback *cb,
 		    r->id.idiag_dport)
 			goto next;
 
-		ret = sk_diag_dump(sk, skb, cb, r, bc, net_admin);
+		ret = sk_diag_dump(sk, skb, cb, r, net_admin);
 next:
 		sock_put(sk);
 		if (ret < 0) {
@@ -199,9 +194,6 @@ static void mptcp_diag_get_info(struct sock *sk, struct inet_diag_msg *r,
 {
 	struct mptcp_sock *msk = mptcp_sk(sk);
 	struct mptcp_info *info = _info;
-	u32 flags = 0;
-	bool slow;
-	u8 val;
 
 	r->idiag_rqueue = sk_rmem_alloc_get(sk);
 	r->idiag_wqueue = sk_wmem_alloc_get(sk);
@@ -221,31 +213,11 @@ static void mptcp_diag_get_info(struct sock *sk, struct inet_diag_msg *r,
 	if (!info)
 		return;
 
-	slow = lock_sock_fast(sk);
-	info->mptcpi_subflows = READ_ONCE(msk->pm.subflows);
-	info->mptcpi_add_addr_signal = READ_ONCE(msk->pm.add_addr_signaled);
-	info->mptcpi_add_addr_accepted = READ_ONCE(msk->pm.add_addr_accepted);
-	info->mptcpi_local_addr_used = READ_ONCE(msk->pm.local_addr_used);
-	info->mptcpi_subflows_max = mptcp_pm_get_subflows_max(msk);
-	val = mptcp_pm_get_add_addr_signal_max(msk);
-	info->mptcpi_add_addr_signal_max = val;
-	val = mptcp_pm_get_add_addr_accept_max(msk);
-	info->mptcpi_add_addr_accepted_max = val;
-	info->mptcpi_local_addr_max = mptcp_pm_get_local_addr_max(msk);
-	if (test_bit(MPTCP_FALLBACK_DONE, &msk->flags))
-		flags |= MPTCP_INFO_FLAG_FALLBACK;
-	if (READ_ONCE(msk->can_ack))
-		flags |= MPTCP_INFO_FLAG_REMOTE_KEY_RECEIVED;
-	info->mptcpi_flags = flags;
-	info->mptcpi_token = READ_ONCE(msk->token);
-	info->mptcpi_write_seq = READ_ONCE(msk->write_seq);
-	info->mptcpi_snd_una = READ_ONCE(msk->snd_una);
-	info->mptcpi_rcv_nxt = READ_ONCE(msk->ack_seq);
-	info->mptcpi_csum_enabled = READ_ONCE(msk->csum_enabled);
-	unlock_sock_fast(sk, slow);
+	mptcp_diag_fill_info(msk, info);
 }
 
 static const struct inet_diag_handler mptcp_diag_handler = {
+	.owner		 = THIS_MODULE,
 	.dump		 = mptcp_diag_dump,
 	.dump_one	 = mptcp_diag_dump_one,
 	.idiag_get_info  = mptcp_diag_get_info,
@@ -266,4 +238,5 @@ static void __exit mptcp_diag_exit(void)
 module_init(mptcp_diag_init);
 module_exit(mptcp_diag_exit);
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("MPTCP socket monitoring via SOCK_DIAG");
 MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_NETLINK, NETLINK_SOCK_DIAG, 2-262 /* AF_INET - IPPROTO_MPTCP */);

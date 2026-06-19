@@ -6,11 +6,15 @@
 #include <linux/highmem.h>
 #include <linux/kthread.h>
 #include <linux/miscdevice.h>
+#include <linux/node.h>
 #include <linux/pagemap.h>
 #include <linux/ratelimit.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
 #include <linux/slab.h>
+#include <linux/sysfs.h>
+#include <linux/vmalloc.h>
+#include <asm/msr.h>
 #include <asm/sgx.h>
 #include "driver.h"
 #include "encl.h"
@@ -20,6 +24,7 @@ struct sgx_epc_section sgx_epc_sections[SGX_MAX_EPC_SECTIONS];
 static int sgx_nr_epc_sections;
 static struct task_struct *ksgxd_tsk;
 static DECLARE_WAIT_QUEUE_HEAD(ksgxd_waitq);
+static DEFINE_XARRAY(sgx_epc_address_space);
 
 /*
  * These variables are part of the state of the reclaimer, and must be accessed
@@ -63,6 +68,24 @@ static unsigned long __sgx_sanitize_pages(struct list_head *dirty_page_list)
 			return 0;
 
 		page = list_first_entry(dirty_page_list, struct sgx_epc_page, list);
+
+		/*
+		 * Checking page->poison without holding the node->lock
+		 * is racy, but losing the race (i.e. poison is set just
+		 * after the check) just means __eremove() will be uselessly
+		 * called for a page that sgx_free_epc_page() will put onto
+		 * the node->sgx_poison_page_list later.
+		 */
+		if (page->poison) {
+			struct sgx_epc_section *section = &sgx_epc_sections[page->section];
+			struct sgx_numa_node *node = section->node;
+
+			spin_lock(&node->lock);
+			list_move(&page->list, &node->sgx_poison_page_list);
+			spin_unlock(&node->lock);
+
+			continue;
+		}
 
 		ret = __eremove(sgx_get_epc_virt_addr(page));
 		if (!ret) {
@@ -144,52 +167,23 @@ static int __sgx_encl_ewb(struct sgx_epc_page *epc_page, void *va_slot,
 	pginfo.addr = 0;
 	pginfo.secs = 0;
 
-	pginfo.contents = (unsigned long)kmap_atomic(backing->contents);
-	pginfo.metadata = (unsigned long)kmap_atomic(backing->pcmd) +
+	pginfo.contents = (unsigned long)kmap_local_page(backing->contents);
+	pginfo.metadata = (unsigned long)kmap_local_page(backing->pcmd) +
 			  backing->pcmd_offset;
 
 	ret = __ewb(&pginfo, sgx_get_epc_virt_addr(epc_page), va_slot);
 	set_page_dirty(backing->pcmd);
 	set_page_dirty(backing->contents);
 
-	kunmap_atomic((void *)(unsigned long)(pginfo.metadata -
+	kunmap_local((void *)(unsigned long)(pginfo.metadata -
 					      backing->pcmd_offset));
-	kunmap_atomic((void *)(unsigned long)pginfo.contents);
+	kunmap_local((void *)(unsigned long)pginfo.contents);
 
 	return ret;
 }
 
-static void sgx_ipi_cb(void *info)
+void sgx_ipi_cb(void *info)
 {
-}
-
-static const cpumask_t *sgx_encl_ewb_cpumask(struct sgx_encl *encl)
-{
-	cpumask_t *cpumask = &encl->cpumask;
-	struct sgx_encl_mm *encl_mm;
-	int idx;
-
-	/*
-	 * Can race with sgx_encl_mm_add(), but ETRACK has already been
-	 * executed, which means that the CPUs running in the new mm will enter
-	 * into the enclave with a fresh epoch.
-	 */
-	cpumask_clear(cpumask);
-
-	idx = srcu_read_lock(&encl->srcu);
-
-	list_for_each_entry_rcu(encl_mm, &encl->mm_list, list) {
-		if (!mmget_not_zero(encl_mm->mm))
-			continue;
-
-		cpumask_or(cpumask, cpumask, mm_cpumask(encl_mm->mm));
-
-		mmput_async(encl_mm->mm);
-	}
-
-	srcu_read_unlock(&encl->srcu, idx);
-
-	return cpumask;
 }
 
 /*
@@ -238,7 +232,7 @@ static void sgx_encl_ewb(struct sgx_epc_page *epc_page,
 			 * miss cpus that entered the enclave between
 			 * generating the mask and incrementing epoch.
 			 */
-			on_each_cpu_mask(sgx_encl_ewb_cpumask(encl),
+			on_each_cpu_mask(sgx_encl_cpumask(encl),
 					 sgx_ipi_cb, NULL, 1);
 			ret = __sgx_encl_ewb(epc_page, va_slot, backing);
 		}
@@ -305,10 +299,8 @@ static void sgx_reclaim_pages(void)
 {
 	struct sgx_epc_page *chunk[SGX_NR_TO_SCAN];
 	struct sgx_backing backing[SGX_NR_TO_SCAN];
-	struct sgx_epc_section *section;
 	struct sgx_encl_page *encl_page;
 	struct sgx_epc_page *epc_page;
-	struct sgx_numa_node *node;
 	pgoff_t page_index;
 	int cnt = 0;
 	int ret;
@@ -381,13 +373,7 @@ skip:
 		kref_put(&encl_page->encl->refcount, sgx_encl_release);
 		epc_page->flags &= ~SGX_EPC_PAGE_RECLAIMER_TRACKED;
 
-		section = &sgx_epc_sections[epc_page->section];
-		node = section->node;
-
-		spin_lock(&node->lock);
-		list_add_tail(&epc_page->list, &node->free_page_list);
-		spin_unlock(&node->lock);
-		atomic_long_inc(&sgx_nr_free_pages);
+		sgx_free_epc_page(epc_page);
 	}
 }
 
@@ -395,6 +381,17 @@ static bool sgx_should_reclaim(unsigned long watermark)
 {
 	return atomic_long_read(&sgx_nr_free_pages) < watermark &&
 	       !list_empty(&sgx_active_page_list);
+}
+
+/*
+ * sgx_reclaim_direct() should be called (without enclave's mutex held)
+ * in locations where SGX memory resources might be low and might be
+ * needed in order to make forward progress.
+ */
+void sgx_reclaim_direct(void)
+{
+	if (sgx_should_reclaim(SGX_NR_LOW_PAGES))
+		sgx_reclaim_pages();
 }
 
 static int ksgxd(void *p)
@@ -457,6 +454,7 @@ static struct sgx_epc_page *__sgx_alloc_epc_page_from_node(int nid)
 
 	page = list_first_entry(&node->free_page_list, struct sgx_epc_page, list);
 	list_del_init(&page->list);
+	page->flags = 0;
 
 	spin_unlock(&node->lock);
 	atomic_long_dec(&sgx_nr_free_pages);
@@ -611,7 +609,12 @@ void sgx_free_epc_page(struct sgx_epc_page *page)
 
 	spin_lock(&node->lock);
 
-	list_add_tail(&page->list, &node->free_page_list);
+	page->owner = NULL;
+	if (page->poison)
+		list_add(&page->list, &node->sgx_poison_page_list);
+	else
+		list_add_tail(&page->list, &node->free_page_list);
+	page->flags = SGX_EPC_PAGE_IS_FREE;
 
 	spin_unlock(&node->lock);
 	atomic_long_inc(&sgx_nr_free_pages);
@@ -628,25 +631,112 @@ static bool __init sgx_setup_epc_section(u64 phys_addr, u64 size,
 	if (!section->virt_addr)
 		return false;
 
-	section->pages = vmalloc(nr_pages * sizeof(struct sgx_epc_page));
+	section->pages = vmalloc_array(nr_pages, sizeof(struct sgx_epc_page));
 	if (!section->pages) {
 		memunmap(section->virt_addr);
 		return false;
 	}
 
 	section->phys_addr = phys_addr;
+	xa_store_range(&sgx_epc_address_space, section->phys_addr,
+		       phys_addr + size - 1, section, GFP_KERNEL);
 
 	for (i = 0; i < nr_pages; i++) {
 		section->pages[i].section = index;
 		section->pages[i].flags = 0;
 		section->pages[i].owner = NULL;
+		section->pages[i].poison = 0;
 		list_add_tail(&section->pages[i].list, &sgx_dirty_page_list);
 	}
 
 	return true;
 }
 
-/**
+bool arch_is_platform_page(u64 paddr)
+{
+	return !!xa_load(&sgx_epc_address_space, paddr);
+}
+EXPORT_SYMBOL_GPL(arch_is_platform_page);
+
+static struct sgx_epc_page *sgx_paddr_to_page(u64 paddr)
+{
+	struct sgx_epc_section *section;
+
+	section = xa_load(&sgx_epc_address_space, paddr);
+	if (!section)
+		return NULL;
+
+	return &section->pages[PFN_DOWN(paddr - section->phys_addr)];
+}
+
+/*
+ * Called in process context to handle a hardware reported
+ * error in an SGX EPC page.
+ * If the MF_ACTION_REQUIRED bit is set in flags, then the
+ * context is the task that consumed the poison data. Otherwise
+ * this is called from a kernel thread unrelated to the page.
+ */
+int arch_memory_failure(unsigned long pfn, int flags)
+{
+	struct sgx_epc_page *page = sgx_paddr_to_page(pfn << PAGE_SHIFT);
+	struct sgx_epc_section *section;
+	struct sgx_numa_node *node;
+
+	/*
+	 * mm/memory-failure.c calls this routine for all errors
+	 * where there isn't a "struct page" for the address. But that
+	 * includes other address ranges besides SGX.
+	 */
+	if (!page)
+		return -ENXIO;
+
+	/*
+	 * If poison was consumed synchronously. Send a SIGBUS to
+	 * the task. Hardware has already exited the SGX enclave and
+	 * will not allow re-entry to an enclave that has a memory
+	 * error. The signal may help the task understand why the
+	 * enclave is broken.
+	 */
+	if (flags & MF_ACTION_REQUIRED)
+		force_sig(SIGBUS);
+
+	section = &sgx_epc_sections[page->section];
+	node = section->node;
+
+	spin_lock(&node->lock);
+
+	/* Already poisoned? Nothing more to do */
+	if (page->poison)
+		goto out;
+
+	page->poison = 1;
+
+	/*
+	 * If the page is on a free list, move it to the per-node
+	 * poison page list.
+	 */
+	if (page->flags & SGX_EPC_PAGE_IS_FREE) {
+		list_move(&page->list, &node->sgx_poison_page_list);
+		goto out;
+	}
+
+	sgx_unmark_page_reclaimable(page);
+
+	/*
+	 * TBD: Add additional plumbing to enable pre-emptive
+	 * action for asynchronous poison notification. Until
+	 * then just hope that the poison:
+	 * a) is not accessed - sgx_free_epc_page() will deal with it
+	 *    when the user gives it back
+	 * b) results in a recoverable machine check rather than
+	 *    a fatal one
+	 */
+out:
+	spin_unlock(&node->lock);
+	return 0;
+}
+
+/*
  * A section metric is concatenated in a way that @low bits 12-31 define the
  * bits 12-31 of the metric and @high bits 0-19 define the bits 32-51 of the
  * metric.
@@ -656,6 +746,48 @@ static inline u64 __init sgx_calc_section_metric(u64 low, u64 high)
 	return (low & GENMASK_ULL(31, 12)) +
 	       ((high & GENMASK_ULL(19, 0)) << 32);
 }
+
+#ifdef CONFIG_NUMA
+static ssize_t sgx_total_bytes_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", sgx_numa_nodes[dev->id].size);
+}
+static DEVICE_ATTR_RO(sgx_total_bytes);
+
+static umode_t arch_node_attr_is_visible(struct kobject *kobj,
+		struct attribute *attr, int idx)
+{
+	/* Make all x86/ attributes invisible when SGX is not initialized: */
+	if (nodes_empty(sgx_numa_mask))
+		return 0;
+
+	return attr->mode;
+}
+
+static struct attribute *arch_node_dev_attrs[] = {
+	&dev_attr_sgx_total_bytes.attr,
+	NULL,
+};
+
+const struct attribute_group arch_node_dev_group = {
+	.name = "x86",
+	.attrs = arch_node_dev_attrs,
+	.is_visible = arch_node_attr_is_visible,
+};
+
+static void __init arch_update_sysfs_visibility(int nid)
+{
+	struct node *node = node_devices[nid];
+	int ret;
+
+	ret = sysfs_update_group(&node->dev.kobj, &arch_node_dev_group);
+
+	if (ret)
+		pr_err("sysfs update failed (%d), files may be invisible", ret);
+}
+#else /* !CONFIG_NUMA */
+static void __init arch_update_sysfs_visibility(int nid) {}
+#endif
 
 static bool __init sgx_page_cache_init(void)
 {
@@ -700,10 +832,16 @@ static bool __init sgx_page_cache_init(void)
 		if (!node_isset(nid, sgx_numa_mask)) {
 			spin_lock_init(&sgx_numa_nodes[nid].lock);
 			INIT_LIST_HEAD(&sgx_numa_nodes[nid].free_page_list);
+			INIT_LIST_HEAD(&sgx_numa_nodes[nid].sgx_poison_page_list);
 			node_set(nid, sgx_numa_mask);
+			sgx_numa_nodes[nid].size = 0;
+
+			/* Make SGX-specific node sysfs files visible: */
+			arch_update_sysfs_visibility(nid);
 		}
 
 		sgx_epc_sections[i].node =  &sgx_numa_nodes[nid];
+		sgx_numa_nodes[nid].size += size;
 
 		sgx_nr_epc_sections++;
 	}
@@ -711,6 +849,13 @@ static bool __init sgx_page_cache_init(void)
 	if (!sgx_nr_epc_sections) {
 		pr_err("There are zero EPC sections.\n");
 		return false;
+	}
+
+	for_each_online_node(nid) {
+		if (!node_isset(nid, sgx_numa_mask) &&
+		    node_state(nid, N_MEMORY) && node_state(nid, N_CPU))
+			pr_info("node%d has both CPUs and memory but doesn't have an EPC section\n",
+				nid);
 	}
 
 	return true;
@@ -729,7 +874,7 @@ void sgx_update_lepubkeyhash(u64 *lepubkeyhash)
 	WARN_ON_ONCE(preemptible());
 
 	for (i = 0; i < 4; i++)
-		wrmsrl(MSR_IA32_SGXLEPUBKEYHASH0 + i, lepubkeyhash[i]);
+		wrmsrq(MSR_IA32_SGXLEPUBKEYHASH0 + i, lepubkeyhash[i]);
 }
 
 const struct file_operations sgx_provision_fops = {
@@ -759,20 +904,15 @@ static struct miscdevice sgx_dev_provision = {
 int sgx_set_attribute(unsigned long *allowed_attributes,
 		      unsigned int attribute_fd)
 {
-	struct file *file;
+	CLASS(fd, f)(attribute_fd);
 
-	file = fget(attribute_fd);
-	if (!file)
+	if (fd_empty(f))
 		return -EINVAL;
 
-	if (file->f_op != &sgx_provision_fops) {
-		fput(file);
+	if (fd_file(f)->f_op != &sgx_provision_fops)
 		return -EINVAL;
-	}
 
 	*allowed_attributes |= SGX_ATTR_PROVISIONKEY;
-
-	fput(file);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(sgx_set_attribute);

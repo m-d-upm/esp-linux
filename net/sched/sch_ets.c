@@ -41,7 +41,7 @@ struct ets_class {
 	struct Qdisc *qdisc;
 	u32 quantum;
 	u32 deficit;
-	struct gnet_stats_basic_packed bstats;
+	struct gnet_stats_basic_sync bstats;
 	struct gnet_stats_queue qstats;
 };
 
@@ -115,12 +115,12 @@ static void ets_offload_change(struct Qdisc *sch)
 	struct ets_sched *q = qdisc_priv(sch);
 	struct tc_ets_qopt_offload qopt;
 	unsigned int w_psum_prev = 0;
-	unsigned int q_psum = 0;
-	unsigned int q_sum = 0;
 	unsigned int quantum;
 	unsigned int w_psum;
 	unsigned int weight;
 	unsigned int i;
+	u64 q_psum = 0;
+	u64 q_sum = 0;
 
 	if (!tc_can_offload(dev) || !dev->netdev_ops->ndo_setup_tc)
 		return;
@@ -138,8 +138,12 @@ static void ets_offload_change(struct Qdisc *sch)
 
 	for (i = 0; i < q->nbands; i++) {
 		quantum = q->classes[i].quantum;
-		q_psum += quantum;
-		w_psum = quantum ? q_psum * 100 / q_sum : 0;
+		if (quantum) {
+			q_psum += quantum;
+			w_psum = div64_u64(q_psum * 100, q_sum);
+		} else {
+			w_psum = 0;
+		}
 		weight = w_psum - w_psum_prev;
 		w_psum_prev = w_psum;
 
@@ -332,8 +336,7 @@ static int ets_class_dump_stats(struct Qdisc *sch, unsigned long arg,
 	struct ets_class *cl = ets_class_from_arg(sch, arg);
 	struct Qdisc *cl_q = cl->qdisc;
 
-	if (gnet_stats_copy_basic(qdisc_root_sleeping_running(sch),
-				  d, NULL, &cl_q->bstats) < 0 ||
+	if (gnet_stats_copy_basic(d, NULL, &cl_q->bstats, true) < 0 ||
 	    qdisc_qstats_copy(d, cl_q) < 0)
 		return -1;
 
@@ -349,15 +352,8 @@ static void ets_qdisc_walk(struct Qdisc *sch, struct qdisc_walker *arg)
 		return;
 
 	for (i = 0; i < q->nbands; i++) {
-		if (arg->count < arg->skip) {
-			arg->count++;
-			continue;
-		}
-		if (arg->fn(sch, i + 1, arg) < 0) {
-			arg->stop = 1;
+		if (!tc_qdisc_stats_dump(sch, i + 1, arg))
 			break;
-		}
-		arg->count++;
 	}
 }
 
@@ -600,11 +596,6 @@ static int ets_qdisc_change(struct Qdisc *sch, struct nlattr *opt,
 	unsigned int i;
 	int err;
 
-	if (!opt) {
-		NL_SET_ERR_MSG(extack, "ETS options are required for this operation");
-		return -EINVAL;
-	}
-
 	err = nla_parse_nested(tb, TCA_ETS_MAX, opt, ets_policy, extack);
 	if (err < 0)
 		return err;
@@ -701,7 +692,7 @@ static int ets_qdisc_change(struct Qdisc *sch, struct nlattr *opt,
 		q->classes[i].qdisc = NULL;
 		WRITE_ONCE(q->classes[i].quantum, 0);
 		q->classes[i].deficit = 0;
-		memset(&q->classes[i].bstats, 0, sizeof(q->classes[i].bstats));
+		gnet_stats_basic_sync_init(&q->classes[i].bstats);
 		memset(&q->classes[i].qstats, 0, sizeof(q->classes[i].qstats));
 	}
 	return 0;
@@ -838,6 +829,7 @@ static struct Qdisc_ops ets_qdisc_ops __read_mostly = {
 	.dump		= ets_qdisc_dump,
 	.owner		= THIS_MODULE,
 };
+MODULE_ALIAS_NET_SCH("ets");
 
 static int __init ets_init(void)
 {
@@ -852,3 +844,4 @@ static void __exit ets_exit(void)
 module_init(ets_init);
 module_exit(ets_exit);
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Enhanced Transmission Selection(ETS) scheduler");

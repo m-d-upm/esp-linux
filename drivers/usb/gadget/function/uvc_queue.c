@@ -21,6 +21,7 @@
 #include <media/videobuf2-vmalloc.h>
 
 #include "uvc.h"
+#include "uvc_video.h"
 
 /* ------------------------------------------------------------------------
  * Video buffers queue management.
@@ -44,26 +45,15 @@ static int uvc_queue_setup(struct vb2_queue *vq,
 {
 	struct uvc_video_queue *queue = vb2_get_drv_priv(vq);
 	struct uvc_video *video = container_of(queue, struct uvc_video, queue);
-	unsigned int req_size;
-	unsigned int nreq;
 
 	if (*nbuffers > UVC_MAX_VIDEO_BUFFERS)
 		*nbuffers = UVC_MAX_VIDEO_BUFFERS;
+	if (*nbuffers < UVCG_STREAMING_MIN_BUFFERS)
+		*nbuffers = UVCG_STREAMING_MIN_BUFFERS;
 
 	*nplanes = 1;
 
 	sizes[0] = video->imagesize;
-
-	req_size = video->ep->maxpacket
-		 * max_t(unsigned int, video->ep->maxburst, 1)
-		 * (video->ep->mult);
-
-	/* We divide by two, to increase the chance to run
-	 * into fewer requests for smaller framesizes.
-	 */
-	nreq = DIV_ROUND_UP(DIV_ROUND_UP(sizes[0], 2), req_size);
-	nreq = clamp(nreq, 4U, 64U);
-	video->uvc_num_requests = nreq;
 
 	return 0;
 }
@@ -71,6 +61,7 @@ static int uvc_queue_setup(struct vb2_queue *vq,
 static int uvc_buffer_prepare(struct vb2_buffer *vb)
 {
 	struct uvc_video_queue *queue = vb2_get_drv_priv(vb->vb2_queue);
+	struct uvc_video *video = container_of(queue, struct uvc_video, queue);
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 	struct uvc_buffer *buf = container_of(vbuf, struct uvc_buffer, buf);
 
@@ -91,10 +82,22 @@ static int uvc_buffer_prepare(struct vb2_buffer *vb)
 		buf->mem = vb2_plane_vaddr(vb, 0);
 	}
 	buf->length = vb2_plane_size(vb, 0);
-	if (vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE)
+	if (vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE) {
 		buf->bytesused = 0;
-	else
+	} else {
 		buf->bytesused = vb2_get_plane_payload(vb, 0);
+
+		if (video->reqs_per_frame != 0)	{
+			buf->req_payload_size =
+				DIV_ROUND_UP(buf->bytesused +
+					(video->reqs_per_frame * UVCG_REQUEST_HEADER_LEN),
+					video->reqs_per_frame);
+			if (buf->req_payload_size > video->req_size)
+				buf->req_payload_size = video->req_size;
+		} else {
+			buf->req_payload_size = video->max_req_size;
+		}
+	}
 
 	return 0;
 }
@@ -111,7 +114,8 @@ static void uvc_buffer_queue(struct vb2_buffer *vb)
 	if (likely(!(queue->flags & UVC_QUEUE_DISCONNECTED))) {
 		list_add_tail(&buf->queue, &queue->irqqueue);
 	} else {
-		/* If the device is disconnected return the buffer to userspace
+		/*
+		 * If the device is disconnected return the buffer to userspace
 		 * directly. The next QBUF call will fail with -ENODEV.
 		 */
 		buf->state = UVC_BUF_STATE_ERROR;
@@ -125,8 +129,6 @@ static const struct vb2_ops uvc_queue_qops = {
 	.queue_setup = uvc_queue_setup,
 	.buf_prepare = uvc_buffer_prepare,
 	.buf_queue = uvc_buffer_queue,
-	.wait_prepare = vb2_ops_wait_prepare,
-	.wait_finish = vb2_ops_wait_finish,
 };
 
 int uvcg_queue_init(struct uvc_video_queue *queue, struct device *dev, enum v4l2_buf_type type,
@@ -149,7 +151,7 @@ int uvcg_queue_init(struct uvc_video_queue *queue, struct device *dev, enum v4l2
 		queue->queue.mem_ops = &vb2_vmalloc_memops;
 	}
 
-	queue->queue.timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC
+	queue->queue.timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY
 				     | V4L2_BUF_FLAG_TSTAMP_SRC_EOF;
 	queue->queue.dev = dev;
 
@@ -192,18 +194,7 @@ int uvcg_query_buffer(struct uvc_video_queue *queue, struct v4l2_buffer *buf)
 
 int uvcg_queue_buffer(struct uvc_video_queue *queue, struct v4l2_buffer *buf)
 {
-	unsigned long flags;
-	int ret;
-
-	ret = vb2_qbuf(&queue->queue, NULL, buf);
-	if (ret < 0)
-		return ret;
-
-	spin_lock_irqsave(&queue->irqlock, flags);
-	ret = (queue->flags & UVC_QUEUE_PAUSED) != 0;
-	queue->flags &= ~UVC_QUEUE_PAUSED;
-	spin_unlock_irqrestore(&queue->irqlock, flags);
-	return ret;
+	return vb2_qbuf(&queue->queue, NULL, buf);
 }
 
 /*
@@ -273,7 +264,8 @@ void uvcg_queue_cancel(struct uvc_video_queue *queue, int disconnect)
 	}
 	queue->buf_used = 0;
 
-	/* This must be protected by the irqlock spinlock to avoid race
+	/*
+	 * This must be protected by the irqlock spinlock to avoid race
 	 * conditions between uvc_queue_buffer and the disconnection event that
 	 * could result in an interruptible wait in uvc_dequeue_buffer. Do not
 	 * blindly replace this logic by checking for the UVC_DEV_DISCONNECTED
@@ -362,8 +354,6 @@ struct uvc_buffer *uvcg_queue_head(struct uvc_video_queue *queue)
 	if (!list_empty(&queue->irqqueue))
 		buf = list_first_entry(&queue->irqqueue, struct uvc_buffer,
 				       queue);
-	else
-		queue->flags |= UVC_QUEUE_PAUSED;
 
 	return buf;
 }

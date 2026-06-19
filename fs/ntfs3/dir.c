@@ -26,8 +26,8 @@ int ntfs_utf16_to_nls(struct ntfs_sb_info *sbi, const __le16 *name, u32 len,
 
 	if (!nls) {
 		/* UTF-16 -> UTF-8 */
-		ret = utf16s_to_utf8s(name, len, UTF16_LITTLE_ENDIAN, buf,
-				      buf_len);
+		ret = utf16s_to_utf8s((wchar_t *)name, len, UTF16_LITTLE_ENDIAN,
+				      buf, buf_len);
 		buf[ret] = '\0';
 		return ret;
 	}
@@ -332,8 +332,7 @@ static inline bool ntfs_dir_emit(struct ntfs_sb_info *sbi,
 	 * It does additional locks/reads just to get the type of name.
 	 * Should we use additional mount option to enable branch below?
 	 */
-	if (((fname->dup.fa & FILE_ATTRIBUTE_REPARSE_POINT) ||
-	     fname->dup.ea_size) &&
+	if (fname->dup.extend_data &&
 	    ino != ni->mi.rno) {
 		struct inode *inode = ntfs_iget5(sbi->sb, &e->ref, NULL);
 		if (!IS_ERR_OR_NULL(inode)) {
@@ -425,8 +424,7 @@ static int ntfs_readdir(struct file *file, struct dir_context *ctx)
 	if (!dir_emit_dots(file, ctx))
 		return 0;
 
-	/* Allocate PATH_MAX bytes. */
-	name = __getname();
+	name = kmalloc(PATH_MAX, GFP_KERNEL);
 	if (!name)
 		return -ENOMEM;
 
@@ -504,7 +502,7 @@ static int ntfs_readdir(struct file *file, struct dir_context *ctx)
 
 out:
 
-	__putname(name);
+	kfree(name);
 	put_indx_node(node);
 
 	if (err == 1) {
@@ -515,7 +513,7 @@ out:
 		ctx->pos = pos;
 	} else if (err < 0) {
 		if (err == -EINVAL)
-			ntfs_inode_err(dir, "directory corrupted");
+			_ntfs_bad_inode(dir);
 		ctx->pos = eod;
 	}
 
@@ -534,7 +532,7 @@ static int ntfs_dir_count(struct inode *dir, bool *is_empty, size_t *dirs,
 	u32 e_size, off, end;
 	size_t drs = 0, fles = 0, bit = 0;
 	struct indx_node *node = NULL;
-	size_t max_indx = ni->vfs_inode.i_size >> ni->dir.index_bits;
+	size_t max_indx = i_size_read(&ni->vfs_inode) >> ni->dir.index_bits;
 
 	if (is_empty)
 		*is_empty = true;
@@ -553,8 +551,10 @@ static int ntfs_dir_count(struct inode *dir, bool *is_empty, size_t *dirs,
 			e = Add2Ptr(hdr, off);
 			e_size = le16_to_cpu(e->size);
 			if (e_size < sizeof(struct NTFS_DE) ||
-			    off + e_size > end)
+			    off + e_size > end) {
+				/* Looks like corruption. */
 				break;
+			}
 
 			if (de_is_last(e))
 				break;
@@ -626,5 +626,18 @@ const struct file_operations ntfs_dir_operations = {
 	.iterate_shared	= ntfs_readdir,
 	.fsync		= generic_file_fsync,
 	.open		= ntfs_file_open,
+	.unlocked_ioctl = ntfs_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl   = ntfs_compat_ioctl,
+#endif
 };
+
+#if IS_ENABLED(CONFIG_NTFS_FS)
+const struct file_operations ntfs_legacy_dir_operations = {
+	.llseek		= generic_file_llseek,
+	.read		= generic_read_dir,
+	.iterate_shared	= ntfs_readdir,
+	.open		= ntfs_file_open,
+};
+#endif
 // clang-format on

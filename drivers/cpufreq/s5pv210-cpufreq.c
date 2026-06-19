@@ -243,7 +243,7 @@ static int s5pv210_target(struct cpufreq_policy *policy, unsigned int index)
 	new_freq = s5pv210_freq_table[index].frequency;
 
 	/* Finding current running level index */
-	priv_index = cpufreq_table_find_index_h(policy, old_freq);
+	priv_index = cpufreq_table_find_index_h(policy, old_freq, false);
 
 	arm_volt = dvs_conf[index].arm_volt;
 	int_volt = dvs_conf[index].int_volt;
@@ -556,17 +556,15 @@ out_dmc0:
 static int s5pv210_cpufreq_reboot_notifier_event(struct notifier_block *this,
 						 unsigned long event, void *ptr)
 {
+	struct cpufreq_policy *policy __free(put_cpufreq_policy) = cpufreq_cpu_get(0);
 	int ret;
-	struct cpufreq_policy *policy;
 
-	policy = cpufreq_cpu_get(0);
 	if (!policy) {
 		pr_debug("cpufreq: get no policy for cpu0\n");
 		return NOTIFY_BAD;
 	}
 
 	ret = cpufreq_driver_target(policy, SLEEP_FREQ, 0);
-	cpufreq_cpu_put(policy);
 
 	if (ret < 0)
 		return NOTIFY_BAD;

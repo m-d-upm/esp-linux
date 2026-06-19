@@ -12,7 +12,6 @@
 #include <linux/kernel.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
-#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 
@@ -20,6 +19,7 @@
 #include <video/of_videomode.h>
 
 #include <drm/drm_fourcc.h>
+#include <drm/drm_framebuffer.h>
 #include <drm/drm_vblank.h>
 #include <drm/exynos_drm.h>
 
@@ -36,6 +36,24 @@
 #define MIN_FB_WIDTH_FOR_16WORD_BURST 128
 
 #define WINDOWS_NR	2
+
+struct decon_data {
+	unsigned int vidw_buf_start_base;
+	unsigned int shadowcon_win_protect_shift;
+	unsigned int wincon_burstlen_shift;
+};
+
+static const struct decon_data exynos7_decon_data = {
+	.vidw_buf_start_base = 0x80,
+	.shadowcon_win_protect_shift = 10,
+	.wincon_burstlen_shift = 11,
+};
+
+static const struct decon_data exynos7870_decon_data = {
+	.vidw_buf_start_base = 0x880,
+	.shadowcon_win_protect_shift = 8,
+	.wincon_burstlen_shift = 10,
+};
 
 struct decon_context {
 	struct device			*dev;
@@ -54,11 +72,19 @@ struct decon_context {
 	wait_queue_head_t		wait_vsync_queue;
 	atomic_t			wait_vsync_event;
 
+	const struct decon_data *data;
 	struct drm_encoder *encoder;
 };
 
 static const struct of_device_id decon_driver_dt_match[] = {
-	{.compatible = "samsung,exynos7-decon"},
+	{
+		.compatible = "samsung,exynos7-decon",
+		.data = &exynos7_decon_data,
+	},
+	{
+		.compatible = "samsung,exynos7870-decon",
+		.data = &exynos7870_decon_data,
+	},
 	{},
 };
 MODULE_DEVICE_TABLE(of, decon_driver_dt_match);
@@ -91,8 +117,9 @@ static void decon_shadow_protect_win(struct decon_context *ctx,
 				     unsigned int win, bool protect)
 {
 	u32 bits, val;
+	unsigned int shift = ctx->data->shadowcon_win_protect_shift;
 
-	bits = SHADOWCON_WINx_PROTECT(win);
+	bits = SHADOWCON_WINx_PROTECT(shift, win);
 
 	val = readl(ctx->regs + SHADOWCON);
 	if (protect)
@@ -164,7 +191,7 @@ static void decon_ctx_remove(struct decon_context *ctx)
 static u32 decon_calc_clkdiv(struct decon_context *ctx,
 		const struct drm_display_mode *mode)
 {
-	unsigned long ideal_clk = mode->clock;
+	unsigned long ideal_clk = mode->clock * 1000;
 	u32 clkdiv;
 
 	/* Find the clock divider value that gets us closest to ideal_clk */
@@ -278,6 +305,7 @@ static void decon_win_set_pixfmt(struct decon_context *ctx, unsigned int win,
 {
 	unsigned long val;
 	int padding;
+	unsigned int shift = ctx->data->wincon_burstlen_shift;
 
 	val = readl(ctx->regs + WINCON(win));
 	val &= ~WINCONx_BPPMODE_MASK;
@@ -285,44 +313,44 @@ static void decon_win_set_pixfmt(struct decon_context *ctx, unsigned int win,
 	switch (fb->format->format) {
 	case DRM_FORMAT_RGB565:
 		val |= WINCONx_BPPMODE_16BPP_565;
-		val |= WINCONx_BURSTLEN_16WORD;
+		val |= WINCONx_BURSTLEN_16WORD(shift);
 		break;
 	case DRM_FORMAT_XRGB8888:
 		val |= WINCONx_BPPMODE_24BPP_xRGB;
-		val |= WINCONx_BURSTLEN_16WORD;
+		val |= WINCONx_BURSTLEN_16WORD(shift);
 		break;
 	case DRM_FORMAT_XBGR8888:
 		val |= WINCONx_BPPMODE_24BPP_xBGR;
-		val |= WINCONx_BURSTLEN_16WORD;
+		val |= WINCONx_BURSTLEN_16WORD(shift);
 		break;
 	case DRM_FORMAT_RGBX8888:
 		val |= WINCONx_BPPMODE_24BPP_RGBx;
-		val |= WINCONx_BURSTLEN_16WORD;
+		val |= WINCONx_BURSTLEN_16WORD(shift);
 		break;
 	case DRM_FORMAT_BGRX8888:
 		val |= WINCONx_BPPMODE_24BPP_BGRx;
-		val |= WINCONx_BURSTLEN_16WORD;
+		val |= WINCONx_BURSTLEN_16WORD(shift);
 		break;
 	case DRM_FORMAT_ARGB8888:
 		val |= WINCONx_BPPMODE_32BPP_ARGB | WINCONx_BLD_PIX |
 			WINCONx_ALPHA_SEL;
-		val |= WINCONx_BURSTLEN_16WORD;
+		val |= WINCONx_BURSTLEN_16WORD(shift);
 		break;
 	case DRM_FORMAT_ABGR8888:
 		val |= WINCONx_BPPMODE_32BPP_ABGR | WINCONx_BLD_PIX |
 			WINCONx_ALPHA_SEL;
-		val |= WINCONx_BURSTLEN_16WORD;
+		val |= WINCONx_BURSTLEN_16WORD(shift);
 		break;
 	case DRM_FORMAT_RGBA8888:
 		val |= WINCONx_BPPMODE_32BPP_RGBA | WINCONx_BLD_PIX |
 			WINCONx_ALPHA_SEL;
-		val |= WINCONx_BURSTLEN_16WORD;
+		val |= WINCONx_BURSTLEN_16WORD(shift);
 		break;
 	case DRM_FORMAT_BGRA8888:
 	default:
 		val |= WINCONx_BPPMODE_32BPP_BGRA | WINCONx_BLD_PIX |
 			WINCONx_ALPHA_SEL;
-		val |= WINCONx_BURSTLEN_16WORD;
+		val |= WINCONx_BURSTLEN_16WORD(shift);
 		break;
 	}
 
@@ -338,8 +366,8 @@ static void decon_win_set_pixfmt(struct decon_context *ctx, unsigned int win,
 
 	padding = (fb->pitches[0] / fb->format->cpp[0]) - fb->width;
 	if (fb->width + padding < MIN_FB_WIDTH_FOR_16WORD_BURST) {
-		val &= ~WINCONx_BURSTLEN_MASK;
-		val |= WINCONx_BURSTLEN_8WORD;
+		val &= ~WINCONx_BURSTLEN_MASK(shift);
+		val |= WINCONx_BURSTLEN_8WORD(shift);
 	}
 
 	writel(val, ctx->regs + WINCON(win));
@@ -381,6 +409,7 @@ static void decon_update_plane(struct exynos_drm_crtc *crtc,
 	unsigned int win = plane->index;
 	unsigned int cpp = fb->format->cpp[0];
 	unsigned int pitch = fb->pitches[0];
+	unsigned int vidw_addr0_base = ctx->data->vidw_buf_start_base;
 
 	/*
 	 * SHADOWCON/PRTCON register is used for enabling timing.
@@ -394,7 +423,7 @@ static void decon_update_plane(struct exynos_drm_crtc *crtc,
 
 	/* buffer start address */
 	val = (unsigned long)exynos_drm_fb_dma_addr(fb, 0);
-	writel(val, ctx->regs + VIDW_BUF_START(win));
+	writel(val, ctx->regs + VIDW_BUF_START(vidw_addr0_base, win));
 
 	padding = (pitch / cpp) - fb->width;
 
@@ -653,7 +682,6 @@ static int decon_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct decon_context *ctx;
 	struct device_node *i80_if_timings;
-	struct resource *res;
 	int ret;
 
 	if (!dev->of_node)
@@ -664,6 +692,7 @@ static int decon_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	ctx->dev = dev;
+	ctx->data = of_device_get_match_data(dev);
 
 	i80_if_timings = of_get_child_by_name(dev->of_node, "i80-if-timings");
 	if (i80_if_timings)
@@ -702,16 +731,11 @@ static int decon_probe(struct platform_device *pdev)
 		goto err_iounmap;
 	}
 
-	res = platform_get_resource_byname(pdev, IORESOURCE_IRQ,
-					   ctx->i80_if ? "lcd_sys" : "vsync");
-	if (!res) {
-		dev_err(dev, "irq request failed.\n");
-		ret = -ENXIO;
+	ret =  platform_get_irq_byname(pdev, ctx->i80_if ? "lcd_sys" : "vsync");
+	if (ret < 0)
 		goto err_iounmap;
-	}
 
-	ret = devm_request_irq(dev, res->start, decon_irq_handler,
-							0, "drm_decon", ctx);
+	ret = devm_request_irq(dev, ret, decon_irq_handler, 0, "drm_decon", ctx);
 	if (ret) {
 		dev_err(dev, "irq request failed.\n");
 		goto err_iounmap;
@@ -745,7 +769,7 @@ err_iounmap:
 	return ret;
 }
 
-static int decon_remove(struct platform_device *pdev)
+static void decon_remove(struct platform_device *pdev)
 {
 	struct decon_context *ctx = dev_get_drvdata(&pdev->dev);
 
@@ -754,11 +778,8 @@ static int decon_remove(struct platform_device *pdev)
 	iounmap(ctx->regs);
 
 	component_del(&pdev->dev, &decon_component_ops);
-
-	return 0;
 }
 
-#ifdef CONFIG_PM
 static int exynos7_decon_suspend(struct device *dev)
 {
 	struct decon_context *ctx = dev_get_drvdata(dev);
@@ -815,21 +836,16 @@ err_aclk_enable:
 err_pclk_enable:
 	return ret;
 }
-#endif
 
-static const struct dev_pm_ops exynos7_decon_pm_ops = {
-	SET_RUNTIME_PM_OPS(exynos7_decon_suspend, exynos7_decon_resume,
-			   NULL)
-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
-				pm_runtime_force_resume)
-};
+static DEFINE_RUNTIME_DEV_PM_OPS(exynos7_decon_pm_ops, exynos7_decon_suspend,
+				 exynos7_decon_resume, NULL);
 
 struct platform_driver decon_driver = {
 	.probe		= decon_probe,
 	.remove		= decon_remove,
 	.driver		= {
 		.name	= "exynos-decon",
-		.pm	= &exynos7_decon_pm_ops,
+		.pm	= pm_ptr(&exynos7_decon_pm_ops),
 		.of_match_table = decon_driver_dt_match,
 	},
 };

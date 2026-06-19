@@ -23,8 +23,6 @@
 #include <asm/stacktrace.h>
 #include <asm/unwind.h>
 
-int panic_on_unrecovered_nmi;
-int panic_on_io_nmi;
 static int die_counter;
 
 static struct pt_regs exec_summary_regs;
@@ -128,7 +126,7 @@ void show_opcodes(struct pt_regs *regs, const char *loglvl)
 		/* No access to the user space stack of other tasks. Ignore. */
 		break;
 	default:
-		printk("%sCode: Unable to access opcode bytes at RIP 0x%lx.\n",
+		printk("%sCode: Unable to access opcode bytes at 0x%lx.\n",
 		       loglvl, prologue);
 		break;
 	}
@@ -413,22 +411,17 @@ NOKPROBE_SYMBOL(oops_end);
 
 static void __die_header(const char *str, struct pt_regs *regs, long err)
 {
-	const char *pr = "";
-
 	/* Save the regs of the first oops for the executive summary later. */
 	if (!die_counter)
 		exec_summary_regs = *regs;
 
-	if (IS_ENABLED(CONFIG_PREEMPTION))
-		pr = IS_ENABLED(CONFIG_PREEMPT_RT) ? " PREEMPT_RT" : " PREEMPT";
-
 	printk(KERN_DEFAULT
-	       "%s: %04lx [#%d]%s%s%s%s%s\n", str, err & 0xffff, ++die_counter,
-	       pr,
+	       "Oops: %s: %04lx [#%d]%s%s%s%s\n", str, err & 0xffff,
+	       ++die_counter,
 	       IS_ENABLED(CONFIG_SMP)     ? " SMP"             : "",
 	       debug_pagealloc_enabled()  ? " DEBUG_PAGEALLOC" : "",
 	       IS_ENABLED(CONFIG_KASAN)   ? " KASAN"           : "",
-	       IS_ENABLED(CONFIG_PAGE_TABLE_ISOLATION) ?
+	       IS_ENABLED(CONFIG_MITIGATION_PAGE_TABLE_ISOLATION) ?
 	       (boot_cpu_has(X86_FEATURE_PTI) ? " PTI" : " NOPTI") : "");
 }
 NOKPROBE_SYMBOL(__die_header);

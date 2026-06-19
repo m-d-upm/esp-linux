@@ -13,10 +13,14 @@
 #include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/pci.h>
+#include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
+#include <linux/iommu.h>
 #include <linux/module.h>
 #include <linux/delay.h>
 #include <linux/property.h>
+#include <linux/string_choices.h>
+#include <linux/string_helpers.h>
 
 #include "nhi.h"
 #include "nhi_regs.h"
@@ -42,6 +46,10 @@
 /* Host interface quirks */
 #define QUIRK_AUTO_CLEAR_INT	BIT(0)
 #define QUIRK_E2E		BIT(1)
+
+static bool host_reset = true;
+module_param(host_reset, bool, 0444);
+MODULE_PARM_DESC(host_reset, "reset USB4 host router (default: true)");
 
 static int ring_interrupt_index(const struct tb_ring *ring)
 {
@@ -139,7 +147,7 @@ static void ring_interrupt_active(struct tb_ring *ring, bool active)
 		dev_WARN(&ring->nhi->pdev->dev,
 					 "interrupt for %s %d is already %s\n",
 					 RING_TYPE(ring), ring->hop,
-					 active ? "enabled" : "disabled");
+					 str_enabled_disabled(active));
 
 	if (active)
 		iowrite32(new, ring->nhi->iobase + reg);
@@ -336,8 +344,10 @@ EXPORT_SYMBOL_GPL(__tb_ring_enqueue);
  *
  * This function can be called when @start_poll callback of the @ring
  * has been called. It will read one completed frame from the ring and
- * return it to the caller. Returns %NULL if there is no more completed
- * frames.
+ * return it to the caller.
+ *
+ * Return: Pointer to &struct ring_frame, %NULL if there is no more
+ * completed frames.
  */
 struct ring_frame *tb_ring_poll(struct tb_ring *ring)
 {
@@ -458,7 +468,7 @@ static int ring_request_msix(struct tb_ring *ring, bool no_suspend)
 	if (!nhi->pdev->msix_enabled)
 		return 0;
 
-	ret = ida_simple_get(&nhi->msix_ida, 0, MSIX_MAX_VECS, GFP_KERNEL);
+	ret = ida_alloc_max(&nhi->msix_ida, MSIX_MAX_VECS - 1, GFP_KERNEL);
 	if (ret < 0)
 		return ret;
 
@@ -478,7 +488,7 @@ static int ring_request_msix(struct tb_ring *ring, bool no_suspend)
 	return 0;
 
 err_ida_remove:
-	ida_simple_remove(&nhi->msix_ida, ring->vector);
+	ida_free(&nhi->msix_ida, ring->vector);
 
 	return ret;
 }
@@ -489,7 +499,7 @@ static void ring_release_msix(struct tb_ring *ring)
 		return;
 
 	free_irq(ring->irq, ring);
-	ida_simple_remove(&ring->nhi->msix_ida, ring->vector);
+	ida_free(&ring->nhi->msix_ida, ring->vector);
 	ring->vector = 0;
 	ring->irq = 0;
 }
@@ -547,7 +557,8 @@ static int nhi_alloc_hop(struct tb_nhi *nhi, struct tb_ring *ring)
 			 ring->hop);
 		ret = -EBUSY;
 		goto err_unlock;
-	} else if (!ring->is_tx && nhi->rx_rings[ring->hop]) {
+	}
+	if (!ring->is_tx && nhi->rx_rings[ring->hop]) {
 		dev_warn(&nhi->pdev->dev, "RX hop %d already allocated\n",
 			 ring->hop);
 		ret = -EBUSY;
@@ -631,6 +642,8 @@ err_free_ring:
  * @hop: HopID (ring) to allocate
  * @size: Number of entries in the ring
  * @flags: Flags for the ring
+ *
+ * Return: Pointer to &struct tb_ring, %NULL otherwise.
  */
 struct tb_ring *tb_ring_alloc_tx(struct tb_nhi *nhi, int hop, int size,
 				 unsigned int flags)
@@ -652,6 +665,8 @@ EXPORT_SYMBOL_GPL(tb_ring_alloc_tx);
  *		interrupt is triggered and masked, instead of callback
  *		in each Rx frame.
  * @poll_data: Optional data passed to @start_poll
+ *
+ * Return: Pointer to &struct tb_ring, %NULL otherwise.
  */
 struct tb_ring *tb_ring_alloc_rx(struct tb_nhi *nhi, int hop, int size,
 				 unsigned int flags, int e2e_tx_hop,
@@ -845,8 +860,9 @@ EXPORT_SYMBOL_GPL(tb_ring_free);
  * @cmd: Command to send
  * @data: Data to be send with the command
  *
- * Sends mailbox command to the firmware running on NHI. Returns %0 in
- * case of success and negative errno in case of failure.
+ * Sends mailbox command to the firmware running on NHI.
+ *
+ * Return: %0 on success, negative errno otherwise.
  */
 int nhi_mailbox_cmd(struct tb_nhi *nhi, enum nhi_mailbox_cmd cmd, u32 data)
 {
@@ -882,6 +898,8 @@ int nhi_mailbox_cmd(struct tb_nhi *nhi, enum nhi_mailbox_cmd cmd, u32 data)
  *
  * The function reads current firmware operation mode using NHI mailbox
  * registers and returns it to the caller.
+ *
+ * Return: &enum nhi_fw_mode.
  */
 enum nhi_fw_mode nhi_mailbox_mode(struct tb_nhi *nhi)
 {
@@ -1002,7 +1020,7 @@ static bool nhi_wake_supported(struct pci_dev *pdev)
 	 * If power rails are sustainable for wakeup from S4 this
 	 * property is set by the BIOS.
 	 */
-	if (device_property_read_u8(&pdev->dev, "WAKE_SUPPORTED", &val))
+	if (!device_property_read_u8(&pdev->dev, "WAKE_SUPPORTED", &val))
 		return !!val;
 
 	return true;
@@ -1172,9 +1190,82 @@ static void nhi_check_quirks(struct tb_nhi *nhi)
 	}
 }
 
+static int nhi_check_iommu_pdev(struct pci_dev *pdev, void *data)
+{
+	if (!pdev->external_facing ||
+	    !device_iommu_capable(&pdev->dev, IOMMU_CAP_PRE_BOOT_PROTECTION))
+		return 0;
+	*(bool *)data = true;
+	return 1; /* Stop walking */
+}
+
+static void nhi_check_iommu(struct tb_nhi *nhi)
+{
+	struct pci_bus *bus = nhi->pdev->bus;
+	bool port_ok = false;
+
+	/*
+	 * Ideally what we'd do here is grab every PCI device that
+	 * represents a tunnelling adapter for this NHI and check their
+	 * status directly, but unfortunately USB4 seems to make it
+	 * obnoxiously difficult to reliably make any correlation.
+	 *
+	 * So for now we'll have to bodge it... Hoping that the system
+	 * is at least sane enough that an adapter is in the same PCI
+	 * segment as its NHI, if we can find *something* on that segment
+	 * which meets the requirements for Kernel DMA Protection, we'll
+	 * take that to imply that firmware is aware and has (hopefully)
+	 * done the right thing in general. We need to know that the PCI
+	 * layer has seen the ExternalFacingPort property which will then
+	 * inform the IOMMU layer to enforce the complete "untrusted DMA"
+	 * flow, but also that the IOMMU driver itself can be trusted not
+	 * to have been subverted by a pre-boot DMA attack.
+	 */
+	while (bus->parent)
+		bus = bus->parent;
+
+	pci_walk_bus(bus, nhi_check_iommu_pdev, &port_ok);
+
+	nhi->iommu_dma_protection = port_ok;
+	dev_dbg(&nhi->pdev->dev, "IOMMU DMA protection is %s\n",
+		str_enabled_disabled(port_ok));
+}
+
+static void nhi_reset(struct tb_nhi *nhi)
+{
+	ktime_t timeout;
+	u32 val;
+
+	val = ioread32(nhi->iobase + REG_CAPS);
+	/* Reset only v2 and later routers */
+	if (FIELD_GET(REG_CAPS_VERSION_MASK, val) < REG_CAPS_VERSION_2)
+		return;
+
+	if (!host_reset) {
+		dev_dbg(&nhi->pdev->dev, "skipping host router reset\n");
+		return;
+	}
+
+	iowrite32(REG_RESET_HRR, nhi->iobase + REG_RESET);
+	msleep(100);
+
+	timeout = ktime_add_ms(ktime_get(), 500);
+	do {
+		val = ioread32(nhi->iobase + REG_RESET);
+		if (!(val & REG_RESET_HRR)) {
+			dev_warn(&nhi->pdev->dev, "host router reset successful\n");
+			return;
+		}
+		usleep_range(10, 20);
+	} while (ktime_before(ktime_get(), timeout));
+
+	dev_warn(&nhi->pdev->dev, "timeout resetting host router\n");
+}
+
 static int nhi_init_msi(struct tb_nhi *nhi)
 {
 	struct pci_dev *pdev = nhi->pdev;
+	struct device *dev = &pdev->dev;
 	int res, irq, nvec;
 
 	/* In case someone left them on. */
@@ -1205,10 +1296,8 @@ static int nhi_init_msi(struct tb_nhi *nhi)
 
 		res = devm_request_irq(&pdev->dev, irq, nhi_msi,
 				       IRQF_NO_SUSPEND, "thunderbolt", nhi);
-		if (res) {
-			dev_err(&pdev->dev, "request_irq failed, aborting\n");
-			return res;
-		}
+		if (res)
+			return dev_err_probe(dev, res, "request_irq failed, aborting\n");
 	}
 
 	return 0;
@@ -1249,26 +1338,17 @@ static struct tb *nhi_select_cm(struct tb_nhi *nhi)
 
 static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
+	struct device *dev = &pdev->dev;
 	struct tb_nhi *nhi;
 	struct tb *tb;
 	int res;
 
-	if (!nhi_imr_valid(pdev)) {
-		dev_warn(&pdev->dev, "firmware image not valid, aborting\n");
-		return -ENODEV;
-	}
+	if (!nhi_imr_valid(pdev))
+		return dev_err_probe(dev, -ENODEV, "firmware image not valid, aborting\n");
 
 	res = pcim_enable_device(pdev);
-	if (res) {
-		dev_err(&pdev->dev, "cannot enable PCI device, aborting\n");
-		return res;
-	}
-
-	res = pcim_iomap_regions(pdev, 1 << 0, "thunderbolt");
-	if (res) {
-		dev_err(&pdev->dev, "cannot obtain PCI resources, aborting\n");
-		return res;
-	}
+	if (res)
+		return dev_err_probe(dev, res, "cannot enable PCI device, aborting\n");
 
 	nhi = devm_kzalloc(&pdev->dev, sizeof(*nhi), GFP_KERNEL);
 	if (!nhi)
@@ -1276,10 +1356,14 @@ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	nhi->pdev = pdev;
 	nhi->ops = (const struct tb_nhi_ops *)id->driver_data;
-	/* cannot fail - table is allocated bin pcim_iomap_regions */
-	nhi->iobase = pcim_iomap_table(pdev)[0];
-	nhi->hop_count = ioread32(nhi->iobase + REG_HOP_COUNT) & 0x3ff;
-	dev_dbg(&pdev->dev, "total paths: %d\n", nhi->hop_count);
+
+	nhi->iobase = pcim_iomap_region(pdev, 0, "thunderbolt");
+	res = PTR_ERR_OR_ZERO(nhi->iobase);
+	if (res)
+		return dev_err_probe(dev, res, "cannot obtain PCI resources, aborting\n");
+
+	nhi->hop_count = ioread32(nhi->iobase + REG_CAPS) & 0x3ff;
+	dev_dbg(dev, "total paths: %d\n", nhi->hop_count);
 
 	nhi->tx_rings = devm_kcalloc(&pdev->dev, nhi->hop_count,
 				     sizeof(*nhi->tx_rings), GFP_KERNEL);
@@ -1289,22 +1373,18 @@ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return -ENOMEM;
 
 	nhi_check_quirks(nhi);
+	nhi_check_iommu(nhi);
+	nhi_reset(nhi);
 
 	res = nhi_init_msi(nhi);
-	if (res) {
-		dev_err(&pdev->dev, "cannot enable MSI, aborting\n");
-		return res;
-	}
+	if (res)
+		return dev_err_probe(dev, res, "cannot enable MSI, aborting\n");
 
 	spin_lock_init(&nhi->lock);
 
 	res = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (res)
-		res = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-	if (res) {
-		dev_err(&pdev->dev, "failed to set DMA mask\n");
-		return res;
-	}
+		return dev_err_probe(dev, res, "failed to set DMA mask\n");
 
 	pci_set_master(pdev);
 
@@ -1315,15 +1395,13 @@ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 
 	tb = nhi_select_cm(nhi);
-	if (!tb) {
-		dev_err(&nhi->pdev->dev,
+	if (!tb)
+		return dev_err_probe(dev, -ENODEV,
 			"failed to determine connection manager, aborting\n");
-		return -ENODEV;
-	}
 
-	dev_dbg(&nhi->pdev->dev, "NHI initialized, starting thunderbolt\n");
+	dev_dbg(dev, "NHI initialized, starting thunderbolt\n");
 
-	res = tb_domain_add(tb);
+	res = tb_domain_add(tb, host_reset);
 	if (res) {
 		/*
 		 * At this point the RX/TX rings might already have been
@@ -1425,6 +1503,7 @@ static struct pci_device_id nhi_ids[] = {
 	  .driver_data = (kernel_ulong_t)&icl_nhi_ops },
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_ICL_NHI1),
 	  .driver_data = (kernel_ulong_t)&icl_nhi_ops },
+	/* Thunderbolt 4 */
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_TGL_NHI0),
 	  .driver_data = (kernel_ulong_t)&icl_nhi_ops },
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_TGL_NHI1),
@@ -1471,6 +1550,7 @@ static struct pci_device_id nhi_ids[] = {
 };
 
 MODULE_DEVICE_TABLE(pci, nhi_ids);
+MODULE_DESCRIPTION("Thunderbolt/USB4 core driver");
 MODULE_LICENSE("GPL");
 
 static struct pci_driver nhi_driver = {

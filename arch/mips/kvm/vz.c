@@ -458,8 +458,8 @@ void kvm_vz_acquire_htimer(struct kvm_vcpu *vcpu)
 /**
  * _kvm_vz_save_htimer() - Switch to software emulation of guest timer.
  * @vcpu:	Virtual CPU.
- * @compare:	Pointer to write compare value to.
- * @cause:	Pointer to write cause value to.
+ * @out_compare: Pointer to write compare value to.
+ * @out_cause:	Pointer to write cause value to.
  *
  * Save VZ guest timer state and switch to software emulation of guest CP0
  * timer. The hard timer must already be in use, so preemption should be
@@ -1541,11 +1541,14 @@ static int kvm_trap_vz_handle_guest_exit(struct kvm_vcpu *vcpu)
 }
 
 /**
- * kvm_trap_vz_handle_cop_unusuable() - Guest used unusable coprocessor.
+ * kvm_trap_vz_handle_cop_unusable() - Guest used unusable coprocessor.
  * @vcpu:	Virtual CPU context.
  *
  * Handle when the guest attempts to use a coprocessor which hasn't been allowed
  * by the root context.
+ *
+ * Return: value indicating whether to resume the host or the guest
+ * 	   (RESUME_HOST or RESUME_GUEST)
  */
 static int kvm_trap_vz_handle_cop_unusable(struct kvm_vcpu *vcpu)
 {
@@ -1592,6 +1595,9 @@ static int kvm_trap_vz_handle_cop_unusable(struct kvm_vcpu *vcpu)
  *
  * Handle when the guest attempts to use MSA when it is disabled in the root
  * context.
+ *
+ * Return: value indicating whether to resume the host or the guest
+ * 	   (RESUME_HOST or RESUME_GUEST)
  */
 static int kvm_trap_vz_handle_msa_disabled(struct kvm_vcpu *vcpu)
 {
@@ -2863,7 +2869,7 @@ static unsigned int kvm_vz_resize_guest_vtlb(unsigned int size)
 	return ret + 1;
 }
 
-static int kvm_vz_hardware_enable(void)
+static int kvm_vz_enable_virtualization_cpu(void)
 {
 	unsigned int mmu_size, guest_mmu_size, ftlb_size;
 	u64 guest_cvmctl, cvmvmconfig;
@@ -2977,7 +2983,7 @@ static int kvm_vz_hardware_enable(void)
 	return 0;
 }
 
-static void kvm_vz_hardware_disable(void)
+static void kvm_vz_disable_virtualization_cpu(void)
 {
 	u64 cvmvmconfig;
 	unsigned int mmu_size;
@@ -3274,8 +3280,8 @@ static struct kvm_mips_callbacks kvm_vz_callbacks = {
 	.handle_msa_disabled = kvm_trap_vz_handle_msa_disabled,
 	.handle_guest_exit = kvm_trap_vz_handle_guest_exit,
 
-	.hardware_enable = kvm_vz_hardware_enable,
-	.hardware_disable = kvm_vz_hardware_disable,
+	.enable_virtualization_cpu = kvm_vz_enable_virtualization_cpu,
+	.disable_virtualization_cpu = kvm_vz_disable_virtualization_cpu,
 	.check_extension = kvm_vz_check_extension,
 	.vcpu_init = kvm_vz_vcpu_init,
 	.vcpu_uninit = kvm_vz_vcpu_uninit,
@@ -3298,7 +3304,10 @@ static struct kvm_mips_callbacks kvm_vz_callbacks = {
 	.vcpu_reenter = kvm_vz_vcpu_reenter,
 };
 
-int kvm_mips_emulation_init(struct kvm_mips_callbacks **install_callbacks)
+/* FIXME: Get rid of the callbacks now that trap-and-emulate is gone. */
+const struct kvm_mips_callbacks * const kvm_mips_callbacks = &kvm_vz_callbacks;
+
+int kvm_mips_emulation_init(void)
 {
 	if (!cpu_has_vz)
 		return -ENODEV;
@@ -3312,7 +3321,5 @@ int kvm_mips_emulation_init(struct kvm_mips_callbacks **install_callbacks)
 		return -ENODEV;
 
 	pr_info("Starting KVM with MIPS VZ extensions\n");
-
-	*install_callbacks = &kvm_vz_callbacks;
 	return 0;
 }

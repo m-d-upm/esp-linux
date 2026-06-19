@@ -16,6 +16,7 @@
 #include <net/netfilter/nf_conntrack_ecache.h>
 #include <net/netfilter/nf_conntrack_timeout.h>
 #include <net/netfilter/nf_conntrack_zones.h>
+#include "nf_internals.h"
 
 static inline int xt_ct_target(struct sk_buff *skb, struct nf_conn *ct)
 {
@@ -96,7 +97,7 @@ xt_ct_set_helper(struct nf_conn *ct, const char *helper_name,
 		return -ENOMEM;
 	}
 
-	help->helper = helper;
+	rcu_assign_pointer(help->helper, helper);
 	return 0;
 }
 
@@ -134,6 +135,21 @@ static u16 xt_ct_flags_to_dir(const struct xt_ct_target_info_v1 *info)
 	default:
 		return NF_CT_DEFAULT_ZONE_DIR;
 	}
+}
+
+static void xt_ct_put_helper(struct nf_conn_help *help)
+{
+	struct nf_conntrack_helper *helper;
+
+	if (!help)
+		return;
+
+	/* not yet exposed to other cpus, or ruleset
+	 * already detached (post-replacement).
+	 */
+	helper = rcu_dereference_raw(help->helper);
+	if (helper)
+		nf_conntrack_helper_put(helper);
 }
 
 static int xt_ct_tg_check(const struct xt_tgchk_param *par,
@@ -207,8 +223,7 @@ out:
 
 err4:
 	help = nfct_help(ct);
-	if (help)
-		nf_conntrack_helper_put(help->helper);
+	xt_ct_put_helper(help);
 err3:
 	nf_ct_tmpl_free(ct);
 err2:
@@ -269,9 +284,11 @@ static void xt_ct_tg_destroy(const struct xt_tgdtor_param *par,
 	struct nf_conn_help *help;
 
 	if (ct) {
+		if (info->helper[0] || info->timeout[0])
+			nf_queue_nf_hook_drop(par->net);
+
 		help = nfct_help(ct);
-		if (help)
-			nf_conntrack_helper_put(help->helper);
+		xt_ct_put_helper(help);
 
 		nf_ct_netns_put(par->net, par->family);
 

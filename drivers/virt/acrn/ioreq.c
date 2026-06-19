@@ -246,13 +246,8 @@ void acrn_ioreq_request_clear(struct acrn_vm *vm)
 	spin_lock_bh(&vm->ioreq_clients_lock);
 	client = vm->default_client;
 	if (client) {
-		vcpu = find_next_bit(client->ioreqs_map,
-				     ACRN_IO_REQUEST_MAX, 0);
-		while (vcpu < ACRN_IO_REQUEST_MAX) {
+		for_each_set_bit(vcpu, client->ioreqs_map, ACRN_IO_REQUEST_MAX)
 			acrn_ioreq_complete_request(client, vcpu, NULL);
-			vcpu = find_next_bit(client->ioreqs_map,
-					     ACRN_IO_REQUEST_MAX, vcpu + 1);
-		}
 	}
 	spin_unlock_bh(&vm->ioreq_clients_lock);
 
@@ -438,7 +433,7 @@ struct acrn_ioreq_client *acrn_ioreq_client_create(struct acrn_vm *vm,
 	client->priv = priv;
 	client->is_default = is_default;
 	if (name)
-		strncpy(client->name, name, sizeof(client->name) - 1);
+		strscpy(client->name, name);
 	rwlock_init(&client->range_lock);
 	INIT_LIST_HEAD(&client->range_list);
 	init_waitqueue_head(&client->wq);
@@ -581,8 +576,8 @@ static void ioreq_resume(void)
 int acrn_ioreq_intr_setup(void)
 {
 	acrn_setup_intr_handler(ioreq_intr_handler);
-	ioreq_wq = alloc_workqueue("ioreq_wq",
-				   WQ_HIGHPRI | WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
+	ioreq_wq = alloc_ordered_workqueue("ioreq_wq",
+					   WQ_HIGHPRI | WQ_MEM_RECLAIM);
 	if (!ioreq_wq) {
 		dev_err(acrn_dev.this_device, "Failed to alloc workqueue!\n");
 		acrn_remove_intr_handler();
@@ -631,7 +626,7 @@ int acrn_ioreq_init(struct acrn_vm *vm, u64 buf_vma)
 	}
 
 	dev_dbg(acrn_dev.this_device,
-		"Init ioreq buffer %pK!\n", vm->ioreq_buf);
+		"Init ioreq buffer %p!\n", vm->ioreq_buf);
 	ret = 0;
 free_buf:
 	kfree(set_buffer);
@@ -643,7 +638,7 @@ void acrn_ioreq_deinit(struct acrn_vm *vm)
 	struct acrn_ioreq_client *client, *next;
 
 	dev_dbg(acrn_dev.this_device,
-		"Deinit ioreq buffer %pK!\n", vm->ioreq_buf);
+		"Deinit ioreq buffer %p!\n", vm->ioreq_buf);
 	/* Destroy all clients belonging to this VM */
 	list_for_each_entry_safe(client, next, &vm->ioreq_clients, list)
 		acrn_ioreq_client_destroy(client);

@@ -685,7 +685,7 @@ void bnx2i_update_iscsi_conn(struct iscsi_conn *conn)
  */
 void bnx2i_ep_ofld_timer(struct timer_list *t)
 {
-	struct bnx2i_endpoint *ep = from_timer(ep, t, ofld_timer);
+	struct bnx2i_endpoint *ep = timer_container_of(ep, t, ofld_timer);
 
 	if (ep->state == EP_STATE_OFLD_START) {
 		printk(KERN_ALERT "ofld_timer: CONN_OFLD timeout\n");
@@ -2398,7 +2398,7 @@ static void bnx2i_process_conn_destroy_cmpl(struct bnx2i_hba *hba,
 	}
 
 	if (hba != ep->hba) {
-		printk(KERN_ALERT "conn destroy- error hba mis-match\n");
+		printk(KERN_ALERT "conn destroy- error hba mismatch\n");
 		return;
 	}
 
@@ -2432,7 +2432,7 @@ static void bnx2i_process_ofld_cmpl(struct bnx2i_hba *hba,
 	}
 
 	if (hba != ep->hba) {
-		printk(KERN_ALERT "ofld_cmpl: error hba mis-match\n");
+		printk(KERN_ALERT "ofld_cmpl: error hba mismatch\n");
 		return;
 	}
 

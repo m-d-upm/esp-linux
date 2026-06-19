@@ -189,7 +189,7 @@ static int __must_check nr_add_node(ax25_address *nr, const char *mnemonic,
 		}
 
 		nr_node->callsign = *nr;
-		strcpy(nr_node->mnemonic, mnemonic);
+		strscpy(nr_node->mnemonic, mnemonic);
 
 		nr_node->which = 0;
 		nr_node->count = 1;
@@ -214,7 +214,7 @@ static int __must_check nr_add_node(ax25_address *nr, const char *mnemonic,
 	nr_node_lock(nr_node);
 
 	if (quality != 0)
-		strcpy(nr_node->mnemonic, mnemonic);
+		strscpy(nr_node->mnemonic, mnemonic);
 
 	for (found = 0, i = 0; i < nr_node->count; i++) {
 		if (nr_node->routes[i].neighbour == nr_neigh) {
@@ -593,7 +593,7 @@ struct net_device *nr_dev_get(ax25_address *addr)
 	rcu_read_lock();
 	for_each_netdev_rcu(&init_net, dev) {
 		if ((dev->flags & IFF_UP) && dev->type == ARPHRD_NETROM &&
-		    ax25cmp(addr, (ax25_address *)dev->dev_addr) == 0) {
+		    ax25cmp(addr, (const ax25_address *)dev->dev_addr) == 0) {
 			dev_hold(dev);
 			goto out;
 		}
@@ -752,7 +752,7 @@ int nr_route_frame(struct sk_buff *skb, ax25_cb *ax25)
 	unsigned char *dptr;
 	ax25_cb *ax25s;
 	int ret;
-	struct sk_buff *skbn;
+	struct sk_buff *nskb, *oskb;
 
 	/*
 	 * Reject malformed packets early. Check that it contains at least 2
@@ -811,14 +811,16 @@ int nr_route_frame(struct sk_buff *skb, ax25_cb *ax25)
 	/* We are going to change the netrom headers so we should get our
 	   own skb, we also did not know until now how much header space
 	   we had to reserve... - RXQ */
-	if ((skbn=skb_copy_expand(skb, dev->hard_header_len, 0, GFP_ATOMIC)) == NULL) {
+	nskb = skb_copy_expand(skb, dev->hard_header_len, 0, GFP_ATOMIC);
+
+	if (!nskb) {
 		nr_node_unlock(nr_node);
 		nr_node_put(nr_node);
 		dev_put(dev);
 		return 0;
 	}
-	kfree_skb(skb);
-	skb=skbn;
+	oskb = skb;
+	skb = nskb;
 	skb->data[14]--;
 
 	dptr  = skb_push(skb, 1);
@@ -826,7 +828,7 @@ int nr_route_frame(struct sk_buff *skb, ax25_cb *ax25)
 
 	ax25s = nr_neigh->ax25;
 	nr_neigh->ax25 = ax25_send_frame(skb, 256,
-					 (ax25_address *)dev->dev_addr,
+					 (const ax25_address *)dev->dev_addr,
 					 &nr_neigh->callsign,
 					 nr_neigh->digipeat, nr_neigh->dev);
 	if (ax25s)
@@ -836,6 +838,9 @@ int nr_route_frame(struct sk_buff *skb, ax25_cb *ax25)
 	ret = (nr_neigh->ax25 != NULL);
 	nr_node_unlock(nr_node);
 	nr_node_put(nr_node);
+
+	if (ret)
+		kfree_skb(oskb);
 
 	return ret;
 }

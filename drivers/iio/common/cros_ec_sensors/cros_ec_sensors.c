@@ -16,6 +16,7 @@
 #include <linux/iio/trigger_consumer.h>
 #include <linux/iio/triggered_buffer.h>
 #include <linux/kernel.h>
+#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/platform_data/cros_ec_commands.h>
 #include <linux/platform_data/cros_ec_proto.h>
@@ -310,7 +311,7 @@ static const struct platform_device_id cros_ec_sensors_ids[] = {
 	{
 		.name = "cros-ec-mag",
 	},
-	{ /* sentinel */ }
+	{ }
 };
 MODULE_DEVICE_TABLE(platform, cros_ec_sensors_ids);
 

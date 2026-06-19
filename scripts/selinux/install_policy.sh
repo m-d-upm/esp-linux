@@ -28,8 +28,7 @@ ENABLED=`which selinuxenabled` || {
 if selinuxenabled; then
     echo "SELinux is already enabled"
     echo "This prevents safely relabeling all files."
-    echo "Boot with selinux=0 on the kernel command-line or"
-    echo "SELINUX=disabled in /etc/selinux/config."
+    echo "Boot with selinux=0 on the kernel command-line."
     exit 1
 fi
 
@@ -75,7 +74,7 @@ cd /etc/selinux/dummy/contexts/files
 $SF -F file_contexts /
 
 mounts=`cat /proc/$$/mounts | \
-	grep -E "ext[234]|jfs|xfs|reiserfs|jffs2|gfs2|btrfs|f2fs|ocfs2" | \
+	grep -E "ext[234]|jfs|xfs|jffs2|gfs2|btrfs|f2fs|ocfs2" | \
 	awk '{ print $2 '}`
 $SF -F file_contexts $mounts
 

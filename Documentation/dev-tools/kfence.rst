@@ -53,6 +53,13 @@ configurable via the Kconfig option ``CONFIG_KFENCE_DEFERRABLE``.
    The KUnit test suite is very likely to fail when using a deferrable timer
    since it currently causes very unpredictable sample intervals.
 
+By default KFENCE will only sample 1 heap allocation within each sample
+interval. *Burst mode* allows to sample successive heap allocations, where the
+kernel boot parameter ``kfence.burst`` can be set to a non-zero value which
+denotes the *additional* successive allocations within a sample interval;
+setting ``kfence.burst=N`` means that ``1 + N`` successive allocations are
+attempted through KFENCE for each sample interval.
+
 The KFENCE memory pool is of fixed size, and if the pool is exhausted, no
 further KFENCE allocations occur. With ``CONFIG_KFENCE_NUM_OBJECTS`` (default
 255), the number of available guarded objects can be controlled. Each object
@@ -284,6 +291,17 @@ and KFENCE reports a use-after-free access. Freed objects are inserted at the
 tail of KFENCE's freelist, so that the least recently freed objects are reused
 first, and the chances of detecting use-after-frees of recently freed objects
 is increased.
+
+If pool utilization reaches 75% (default) or above, to reduce the risk of the
+pool eventually being fully occupied by allocated objects yet ensure diverse
+coverage of allocations, KFENCE limits currently covered allocations of the
+same source from further filling up the pool. The "source" of an allocation is
+based on its partial allocation stack trace. A side-effect is that this also
+limits frequent long-lived allocations (e.g. pagecache) of the same source
+filling up the pool permanently, which is the most common risk for the pool
+becoming full and the sampled allocation rate dropping to zero. The threshold
+at which to start limiting currently covered allocations can be configured via
+the boot parameter ``kfence.skip_covered_thresh`` (pool usage%).
 
 Interface
 ---------

@@ -14,10 +14,17 @@ init_task_work(struct callback_head *twork, task_work_func_t func)
 }
 
 enum task_work_notify_mode {
-	TWA_NONE,
+	TWA_NONE = 0,
 	TWA_RESUME,
 	TWA_SIGNAL,
+	TWA_SIGNAL_NO_IPI,
+	TWA_NMI_CURRENT,
 };
+
+static inline bool task_work_pending(struct task_struct *task)
+{
+	return READ_ONCE(task->task_works);
+}
 
 int task_work_add(struct task_struct *task, struct callback_head *twork,
 			enum task_work_notify_mode mode);

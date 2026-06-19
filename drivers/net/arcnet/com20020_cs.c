@@ -97,6 +97,7 @@ module_param(backplane, int, 0);
 module_param(clockp, int, 0);
 module_param(clockm, int, 0);
 
+MODULE_DESCRIPTION("ARCnet COM20020 chipset PCMCIA driver");
 MODULE_LICENSE("GPL");
 
 /*====================================================================*/
@@ -134,7 +135,7 @@ static int com20020_probe(struct pcmcia_device *p_dev)
 	lp->hw.owner = THIS_MODULE;
 
 	/* fill in our module parameters as defaults */
-	dev->dev_addr[0] = node;
+	arcnet_set_addr(dev, node);
 
 	p_dev->resource[0]->flags |= IO_DATA_PATH_WIDTH_8;
 	p_dev->resource[0]->end = 16;

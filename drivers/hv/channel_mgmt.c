@@ -20,7 +20,9 @@
 #include <linux/delay.h>
 #include <linux/cpu.h>
 #include <linux/hyperv.h>
+#include <linux/export.h>
 #include <asm/mshyperv.h>
+#include <linux/sched/isolation.h>
 
 #include "hyperv_vmbus.h"
 
@@ -66,7 +68,7 @@ const struct vmbus_device vmbus_devs[] = {
 	{ .dev_type = HV_PCIE,
 	  HV_PCIE_GUID,
 	  .perf_device = false,
-	  .allowed_in_isolated = false,
+	  .allowed_in_isolated = true,
 	},
 
 	/* Synthetic Frame Buffer */
@@ -161,6 +163,7 @@ static const struct {
 	{ HV_AVMA1_GUID },
 	{ HV_AVMA2_GUID },
 	{ HV_RDV_GUID	},
+	{ HV_IMC_GUID	},
 };
 
 /*
@@ -451,7 +454,7 @@ void hv_process_channel_removal(struct vmbus_channel *channel)
 	/*
 	 * Upon suspend, an in-use hv_sock channel is removed from the array of
 	 * channels and the relid is invalidated.  After hibernation, when the
-	 * user-space appplication destroys the channel, it's unnecessary and
+	 * user-space application destroys the channel, it's unnecessary and
 	 * unsafe to remove the channel from the array of channels.  See also
 	 * the inline comments before the call of vmbus_release_relid() below.
 	 */
@@ -727,15 +730,13 @@ static bool hv_cpuself_used(u32 cpu, struct vmbus_channel *chn)
 static int next_numa_node_id;
 
 /*
- * Starting with Win8, we can statically distribute the incoming
- * channel interrupt load by binding a channel to VCPU.
+ * We can statically distribute the incoming channel interrupt load
+ * by binding a channel to VCPU.
  *
- * For pre-win8 hosts or non-performance critical channels we assign the
- * VMBUS_CONNECT_CPU.
- *
- * Starting with win8, performance critical channels will be distributed
- * evenly among all the available NUMA nodes.  Once the node is assigned,
- * we will assign the CPU based on a simple round robin scheme.
+ * For non-performance critical channels we assign the VMBUS_CONNECT_CPU.
+ * Performance critical channels will be distributed evenly among all
+ * the available NUMA nodes.  Once the node is assigned, we will assign
+ * the CPU based on a simple round robin scheme.
  */
 static void init_vp_index(struct vmbus_channel *channel)
 {
@@ -743,18 +744,19 @@ static void init_vp_index(struct vmbus_channel *channel)
 	u32 i, ncpu = num_online_cpus();
 	cpumask_var_t available_mask;
 	struct cpumask *allocated_mask;
+	const struct cpumask *hk_mask = housekeeping_cpumask(HK_TYPE_MANAGED_IRQ);
 	u32 target_cpu;
 	int numa_node;
 
-	if ((vmbus_proto_version == VERSION_WS2008) ||
-	    (vmbus_proto_version == VERSION_WIN7) || (!perf_chn) ||
-	    !alloc_cpumask_var(&available_mask, GFP_KERNEL)) {
+	if (!perf_chn ||
+	    !alloc_cpumask_var(&available_mask, GFP_KERNEL) ||
+	    cpumask_empty(hk_mask)) {
 		/*
-		 * Prior to win8, all channel interrupts are
-		 * delivered on VMBUS_CONNECT_CPU.
-		 * Also if the channel is not a performance critical
+		 * If the channel is not a performance critical
 		 * channel, bind it to VMBUS_CONNECT_CPU.
 		 * In case alloc_cpumask_var() fails, bind it to
+		 * VMBUS_CONNECT_CPU.
+		 * If all the cpus are isolated, bind it to
 		 * VMBUS_CONNECT_CPU.
 		 */
 		channel->target_cpu = VMBUS_CONNECT_CPU;
@@ -776,17 +778,18 @@ static void init_vp_index(struct vmbus_channel *channel)
 		}
 		allocated_mask = &hv_context.hv_numa_map[numa_node];
 
-		if (cpumask_weight(allocated_mask) ==
-		    cpumask_weight(cpumask_of_node(numa_node))) {
+retry:
+		cpumask_xor(available_mask, allocated_mask, cpumask_of_node(numa_node));
+		cpumask_and(available_mask, available_mask, hk_mask);
+
+		if (cpumask_empty(available_mask)) {
 			/*
 			 * We have cycled through all the CPUs in the node;
 			 * reset the allocated map.
 			 */
 			cpumask_clear(allocated_mask);
+			goto retry;
 		}
-
-		cpumask_xor(available_mask, allocated_mask,
-			    cpumask_of_node(numa_node));
 
 		target_cpu = cpumask_first(available_mask);
 		cpumask_set_cpu(target_cpu, allocated_mask);
@@ -942,16 +945,6 @@ void vmbus_initiate_unload(bool crash)
 		vmbus_wait_for_unload();
 }
 
-static void check_ready_for_resume_event(void)
-{
-	/*
-	 * If all the old primary channels have been fixed up, then it's safe
-	 * to resume.
-	 */
-	if (atomic_dec_and_test(&vmbus_connection.nr_chan_fixup_on_resume))
-		complete(&vmbus_connection.ready_for_resume_event);
-}
-
 static void vmbus_setup_channel_state(struct vmbus_channel *channel,
 				      struct vmbus_channel_offer_channel *offer)
 {
@@ -960,11 +953,9 @@ static void vmbus_setup_channel_state(struct vmbus_channel *channel,
 	 */
 	channel->sig_event = VMBUS_EVENT_CONNECTION_ID;
 
-	if (vmbus_proto_version != VERSION_WS2008) {
-		channel->is_dedicated_interrupt =
-				(offer->is_dedicated_interrupt != 0);
-		channel->sig_event = offer->connection_id;
-	}
+	channel->is_dedicated_interrupt =
+			(offer->is_dedicated_interrupt != 0);
+	channel->sig_event = offer->connection_id;
 
 	memcpy(&channel->offermsg, offer,
 	       sizeof(struct vmbus_channel_offer_channel));
@@ -1004,11 +995,15 @@ find_primary_channel_by_offer(const struct vmbus_channel_offer_channel *offer)
 	return channel;
 }
 
-static bool vmbus_is_valid_device(const guid_t *guid)
+static bool vmbus_is_valid_offer(const struct vmbus_channel_offer_channel *offer)
 {
+	const guid_t *guid = &offer->offer.if_type;
 	u16 i;
 
 	if (!hv_is_isolation_supported())
+		return true;
+
+	if (is_hvsock_offer(offer))
 		return true;
 
 	for (i = 0; i < ARRAY_SIZE(vmbus_devs); i++) {
@@ -1032,7 +1027,7 @@ static void vmbus_onoffer(struct vmbus_channel_message_header *hdr)
 
 	trace_vmbus_onoffer(offer);
 
-	if (!vmbus_is_valid_device(&offer->offer.if_type)) {
+	if (!vmbus_is_valid_offer(offer)) {
 		pr_err_ratelimited("Invalid offer %d from the host supporting isolation\n",
 				   offer->child_relid);
 		atomic_dec(&vmbus_connection.offer_in_progress);
@@ -1105,8 +1100,6 @@ static void vmbus_onoffer(struct vmbus_channel_message_header *hdr)
 
 		/* Add the channel back to the array of channels. */
 		vmbus_channel_map_relid(oldchannel);
-		check_ready_for_resume_event();
-
 		mutex_unlock(&vmbus_connection.channel_mutex);
 		return;
 	}
@@ -1292,13 +1285,28 @@ EXPORT_SYMBOL_GPL(vmbus_hvsock_device_unregister);
 
 /*
  * vmbus_onoffers_delivered -
- * This is invoked when all offers have been delivered.
+ * The CHANNELMSG_ALLOFFERS_DELIVERED message arrives after all
+ * boot-time offers are delivered. A boot-time offer is for the primary
+ * channel for any virtual hardware configured in the VM at the time it boots.
+ * Boot-time offers include offers for physical devices assigned to the VM
+ * via Hyper-V's Discrete Device Assignment (DDA) functionality that are
+ * handled as virtual PCI devices in Linux (e.g., NVMe devices and GPUs).
+ * Boot-time offers do not include offers for VMBus sub-channels. Because
+ * devices can be hot-added to the VM after it is booted, additional channel
+ * offers that aren't boot-time offers can be received at any time after the
+ * all-offers-delivered message.
  *
- * Nothing to do here.
+ * SR-IOV NIC Virtual Functions (VFs) assigned to a VM are not considered
+ * to be assigned to the VM at boot-time, and offers for VFs may occur after
+ * the all-offers-delivered message. VFs are optional accelerators to the
+ * synthetic VMBus NIC and are effectively hot-added only after the VMBus
+ * NIC channel is opened (once it knows the guest can support it, via the
+ * sriov bit in the netvsc protocol).
  */
 static void vmbus_onoffers_delivered(
 			struct vmbus_channel_message_header *hdr)
 {
+	complete(&vmbus_connection.all_offers_delivered_event);
 }
 
 /*
@@ -1574,7 +1582,8 @@ void vmbus_onmessage(struct vmbus_channel_message_header *hdr)
 }
 
 /*
- * vmbus_request_offers - Send a request to get all our pending offers.
+ * vmbus_request_offers - Send a request to get all our pending offers
+ * and wait for all boot-time offers to arrive.
  */
 int vmbus_request_offers(void)
 {
@@ -1582,7 +1591,7 @@ int vmbus_request_offers(void)
 	struct vmbus_channel_msginfo *msginfo;
 	int ret;
 
-	msginfo = kmalloc(sizeof(*msginfo) +
+	msginfo = kzalloc(sizeof(*msginfo) +
 			  sizeof(struct vmbus_channel_message_header),
 			  GFP_KERNEL);
 	if (!msginfo)
@@ -1592,6 +1601,10 @@ int vmbus_request_offers(void)
 
 	msg->msgtype = CHANNELMSG_REQUESTOFFERS;
 
+	/*
+	 * This REQUESTOFFERS message will result in the host sending an all
+	 * offers delivered message after all the boot-time offers are sent.
+	 */
 	ret = vmbus_post_msg(msg, sizeof(struct vmbus_channel_message_header),
 			     true);
 
@@ -1603,25 +1616,33 @@ int vmbus_request_offers(void)
 		goto cleanup;
 	}
 
+	/*
+	 * Wait for the host to send all boot-time offers.
+	 * Keeping it as a best-effort mechanism, where a warning is
+	 * printed if a timeout occurs, and execution is resumed.
+	 */
+	if (!wait_for_completion_timeout(&vmbus_connection.all_offers_delivered_event,
+					 secs_to_jiffies(60))) {
+		pr_warn("timed out waiting for all boot-time offers to be delivered.\n");
+	}
+
+	/*
+	 * Flush handling of offer messages (which may initiate work on
+	 * other work queues).
+	 */
+	flush_workqueue(vmbus_connection.work_queue);
+
+	/*
+	 * Flush workqueue for processing the incoming offers. Subchannel
+	 * offers and their processing can happen later, so there is no need to
+	 * flush that workqueue here.
+	 */
+	flush_workqueue(vmbus_connection.handle_primary_chan_wq);
+
 cleanup:
 	kfree(msginfo);
 
 	return ret;
-}
-
-static void invoke_sc_cb(struct vmbus_channel *primary_channel)
-{
-	struct list_head *cur, *tmp;
-	struct vmbus_channel *cur_channel;
-
-	if (primary_channel->sc_creation_callback == NULL)
-		return;
-
-	list_for_each_safe(cur, tmp, &primary_channel->sc_list) {
-		cur_channel = list_entry(cur, struct vmbus_channel, sc_list);
-
-		primary_channel->sc_creation_callback(cur_channel);
-	}
 }
 
 void vmbus_set_sc_create_callback(struct vmbus_channel *primary_channel,
@@ -1630,25 +1651,6 @@ void vmbus_set_sc_create_callback(struct vmbus_channel *primary_channel,
 	primary_channel->sc_creation_callback = sc_cr_cb;
 }
 EXPORT_SYMBOL_GPL(vmbus_set_sc_create_callback);
-
-bool vmbus_are_subchannels_present(struct vmbus_channel *primary)
-{
-	bool ret;
-
-	ret = !list_empty(&primary->sc_list);
-
-	if (ret) {
-		/*
-		 * Invoke the callback on sub-channel creation.
-		 * This will present a uniform interface to the
-		 * clients.
-		 */
-		invoke_sc_cb(primary);
-	}
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(vmbus_are_subchannels_present);
 
 void vmbus_set_chn_rescind_callback(struct vmbus_channel *channel,
 		void (*chn_rescind_cb)(struct vmbus_channel *))

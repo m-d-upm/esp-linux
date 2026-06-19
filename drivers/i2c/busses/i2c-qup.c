@@ -18,9 +18,9 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/module.h>
-#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/property.h>
 #include <linux/scatterlist.h>
 
 /* QUP Registers */
@@ -820,10 +820,8 @@ static int qup_i2c_bam_schedule_desc(struct qup_i2c_dev *qup)
 		dma_async_issue_pending(qup->brx.dma);
 	}
 
-	if (!wait_for_completion_timeout(&qup->xfer, qup->xfer_timeout)) {
-		dev_err(qup->dev, "normal trans timed out\n");
+	if (!wait_for_completion_timeout(&qup->xfer, qup->xfer_timeout))
 		ret = -ETIMEDOUT;
-	}
 
 	if (ret || qup->bus_err || qup->qup_err) {
 		reinit_completion(&qup->xfer);
@@ -1141,7 +1139,6 @@ static int qup_i2c_xfer(struct i2c_adapter *adap,
 		ret = num;
 out:
 
-	pm_runtime_mark_last_busy(qup->dev);
 	pm_runtime_put_autosuspend(qup->dev);
 
 	return ret;
@@ -1321,7 +1318,7 @@ static void qup_i2c_write_rx_tags_v2(struct qup_i2c_dev *qup)
  * 1. Check if tx_tags_sent is false i.e. the start of QUP block so write the
  *    tags to TX FIFO and set tx_tags_sent to true.
  * 2. Check if send_last_word is true. It will be set when last few data bytes
- *    (less than 4 bytes) are reamining to be written in FIFO because of no FIFO
+ *    (less than 4 bytes) are remaining to be written in FIFO because of no FIFO
  *    space. All this data bytes are available in tx_fifo_data so write this
  *    in FIFO.
  * 3. Write the data to TX FIFO and check for cur_blk_len. If it is non zero
@@ -1626,7 +1623,6 @@ static int qup_i2c_xfer_v2(struct i2c_adapter *adap,
 	if (ret == 0)
 		ret = num;
 out:
-	pm_runtime_mark_last_busy(qup->dev);
 	pm_runtime_put_autosuspend(qup->dev);
 
 	return ret;
@@ -1638,13 +1634,13 @@ static u32 qup_i2c_func(struct i2c_adapter *adap)
 }
 
 static const struct i2c_algorithm qup_i2c_algo = {
-	.master_xfer	= qup_i2c_xfer,
-	.functionality	= qup_i2c_func,
+	.xfer = qup_i2c_xfer,
+	.functionality = qup_i2c_func,
 };
 
 static const struct i2c_algorithm qup_i2c_algo_v2 = {
-	.master_xfer	= qup_i2c_xfer_v2,
-	.functionality	= qup_i2c_func,
+	.xfer = qup_i2c_xfer_v2,
+	.functionality = qup_i2c_func,
 };
 
 /*
@@ -1682,7 +1678,7 @@ static void qup_i2c_disable_clocks(struct qup_i2c_dev *qup)
 
 static const struct acpi_device_id qup_i2c_acpi_match[] = {
 	{ "QCOM8010"},
-	{ },
+	{ }
 };
 MODULE_DEVICE_TABLE(acpi, qup_i2c_acpi_match);
 
@@ -1717,7 +1713,7 @@ static int qup_i2c_probe(struct platform_device *pdev)
 		}
 	}
 
-	if (of_device_is_compatible(pdev->dev.of_node, "qcom,i2c-qup-v1.1.1")) {
+	if (device_is_compatible(&pdev->dev, "qcom,i2c-qup-v1.1.1")) {
 		qup->adap.algo = &qup_i2c_algo;
 		qup->adap.quirks = &qup_i2c_quirks;
 		is_qup_v1 = true;
@@ -1842,12 +1838,12 @@ nodma:
 		goto fail;
 
 	ret = devm_request_irq(qup->dev, qup->irq, qup_i2c_interrupt,
-			       IRQF_TRIGGER_HIGH, "i2c_qup", qup);
+			       IRQF_TRIGGER_HIGH | IRQF_NO_AUTOEN,
+			       "i2c_qup", qup);
 	if (ret) {
 		dev_err(qup->dev, "Request %d IRQ failed\n", qup->irq);
 		goto fail;
 	}
-	disable_irq(qup->irq);
 
 	hw_ver = readl(qup->base + QUP_HW_VERSION);
 	dev_dbg(qup->dev, "Revision %x\n", hw_ver);
@@ -1923,7 +1919,7 @@ nodma:
 	qup->adap.dev.of_node = pdev->dev.of_node;
 	qup->is_last = true;
 
-	strlcpy(qup->adap.name, "QUP I2C adapter", sizeof(qup->adap.name));
+	strscpy(qup->adap.name, "QUP I2C adapter", sizeof(qup->adap.name));
 
 	pm_runtime_set_autosuspend_delay(qup->dev, MSEC_PER_SEC);
 	pm_runtime_use_autosuspend(qup->dev);
@@ -1949,7 +1945,7 @@ fail_dma:
 	return ret;
 }
 
-static int qup_i2c_remove(struct platform_device *pdev)
+static void qup_i2c_remove(struct platform_device *pdev)
 {
 	struct qup_i2c_dev *qup = platform_get_drvdata(pdev);
 
@@ -1963,10 +1959,8 @@ static int qup_i2c_remove(struct platform_device *pdev)
 	i2c_del_adapter(&qup->adap);
 	pm_runtime_disable(qup->dev);
 	pm_runtime_set_suspended(qup->dev);
-	return 0;
 }
 
-#ifdef CONFIG_PM
 static int qup_i2c_pm_suspend_runtime(struct device *device)
 {
 	struct qup_i2c_dev *qup = dev_get_drvdata(device);
@@ -1984,9 +1978,7 @@ static int qup_i2c_pm_resume_runtime(struct device *device)
 	qup_i2c_enable_clocks(qup);
 	return 0;
 }
-#endif
 
-#ifdef CONFIG_PM_SLEEP
 static int qup_i2c_suspend(struct device *device)
 {
 	if (!pm_runtime_suspended(device))
@@ -1997,20 +1989,14 @@ static int qup_i2c_suspend(struct device *device)
 static int qup_i2c_resume(struct device *device)
 {
 	qup_i2c_pm_resume_runtime(device);
-	pm_runtime_mark_last_busy(device);
 	pm_request_autosuspend(device);
 	return 0;
 }
-#endif
 
 static const struct dev_pm_ops qup_i2c_qup_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(
-		qup_i2c_suspend,
-		qup_i2c_resume)
-	SET_RUNTIME_PM_OPS(
-		qup_i2c_pm_suspend_runtime,
-		qup_i2c_pm_resume_runtime,
-		NULL)
+	SYSTEM_SLEEP_PM_OPS(qup_i2c_suspend, qup_i2c_resume)
+	RUNTIME_PM_OPS(qup_i2c_pm_suspend_runtime,
+		       qup_i2c_pm_resume_runtime, NULL)
 };
 
 static const struct of_device_id qup_i2c_dt_match[] = {
@@ -2026,7 +2012,7 @@ static struct platform_driver qup_i2c_driver = {
 	.remove = qup_i2c_remove,
 	.driver = {
 		.name = "i2c_qup",
-		.pm = &qup_i2c_qup_pm_ops,
+		.pm = pm_ptr(&qup_i2c_qup_pm_ops),
 		.of_match_table = qup_i2c_dt_match,
 		.acpi_match_table = ACPI_PTR(qup_i2c_acpi_match),
 	},
@@ -2034,5 +2020,6 @@ static struct platform_driver qup_i2c_driver = {
 
 module_platform_driver(qup_i2c_driver);
 
+MODULE_DESCRIPTION("Qualcomm QUP based I2C controller");
 MODULE_LICENSE("GPL v2");
 MODULE_ALIAS("platform:i2c_qup");

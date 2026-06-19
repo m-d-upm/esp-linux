@@ -1,18 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * TI Divider Clock
  *
  * Copyright (C) 2013 Texas Instruments, Inc.
  *
  * Tero Kristo <t-kristo@ti.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed "as is" WITHOUT ANY WARRANTY of any
- * kind, whether express or implied; without even the implied warranty
- * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
 #include <linux/clk-provider.h>
@@ -231,13 +223,15 @@ static int ti_clk_divider_bestdiv(struct clk_hw *hw, unsigned long rate,
 	return bestdiv;
 }
 
-static long ti_clk_divider_round_rate(struct clk_hw *hw, unsigned long rate,
-				      unsigned long *prate)
+static int ti_clk_divider_determine_rate(struct clk_hw *hw,
+					 struct clk_rate_request *req)
 {
 	int div;
-	div = ti_clk_divider_bestdiv(hw, rate, prate);
+	div = ti_clk_divider_bestdiv(hw, req->rate, &req->best_parent_rate);
 
-	return DIV_ROUND_UP(*prate, div);
+	req->rate = DIV_ROUND_UP(req->best_parent_rate, div);
+
+	return 0;
 }
 
 static int ti_clk_divider_set_rate(struct clk_hw *hw, unsigned long rate,
@@ -307,7 +301,7 @@ static void clk_divider_restore_context(struct clk_hw *hw)
 
 const struct clk_ops ti_clk_divider_ops = {
 	.recalc_rate = ti_clk_divider_recalc_rate,
-	.round_rate = ti_clk_divider_round_rate,
+	.determine_rate = ti_clk_divider_determine_rate,
 	.set_rate = ti_clk_divider_set_rate,
 	.save_context = clk_divider_save_context,
 	.restore_context = clk_divider_restore_context,
@@ -485,10 +479,7 @@ static int __init ti_clk_divider_populate(struct device_node *node,
 	if (ret)
 		return ret;
 
-	if (!of_property_read_u32(node, "ti,bit-shift", &val))
-		div->shift = val;
-	else
-		div->shift = 0;
+	div->shift = div->reg.bit;
 
 	if (!of_property_read_u32(node, "ti,latch-bit", &val))
 		div->latch = val;

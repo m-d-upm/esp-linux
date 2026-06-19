@@ -1233,9 +1233,7 @@ static int pn533_init_target_complete(struct pn533 *dev, struct sk_buff *resp)
 
 static void pn533_listen_mode_timer(struct timer_list *t)
 {
-	struct pn533 *dev = from_timer(dev, t, listen_timer);
-
-	dev_dbg(dev->dev, "Listen mode timeout\n");
+	struct pn533 *dev = timer_container_of(dev, t, listen_timer);
 
 	dev->cancel_listen = 1;
 
@@ -1414,11 +1412,9 @@ static int pn533_autopoll_complete(struct pn533 *dev, void *arg,
 			if (dev->poll_mod_count != 0)
 				return rc;
 			goto stop_poll;
-		} else if (rc < 0) {
-			nfc_err(dev->dev,
-				"Error %d when running autopoll\n", rc);
-			goto stop_poll;
 		}
+		nfc_err(dev->dev, "Error %d when running autopoll\n", rc);
+		goto stop_poll;
 	}
 
 	nbtg = resp->data[0];
@@ -1507,17 +1503,15 @@ static int pn533_poll_complete(struct pn533 *dev, void *arg,
 			if (dev->poll_mod_count != 0)
 				return rc;
 			goto stop_poll;
-		} else if (rc < 0) {
-			nfc_err(dev->dev,
-				"Error %d when running poll\n", rc);
-			goto stop_poll;
 		}
+		nfc_err(dev->dev, "Error %d when running poll\n", rc);
+		goto stop_poll;
 	}
 
 	cur_mod = dev->poll_mod_active[dev->poll_mod_curr];
 
 	if (cur_mod->len == 0) { /* Target mode */
-		del_timer(&dev->listen_timer);
+		timer_delete(&dev->listen_timer);
 		rc = pn533_init_target_complete(dev, resp);
 		goto done;
 	}
@@ -1751,7 +1745,7 @@ static void pn533_stop_poll(struct nfc_dev *nfc_dev)
 {
 	struct pn533 *dev = nfc_get_drvdata(nfc_dev);
 
-	del_timer(&dev->listen_timer);
+	timer_delete(&dev->listen_timer);
 
 	if (!dev->poll_mod_count) {
 		dev_dbg(dev->dev,
@@ -2182,7 +2176,7 @@ void pn533_recv_frame(struct pn533 *dev, struct sk_buff *skb, int status)
 	}
 
 	if (skb == NULL) {
-		pr_err("NULL Frame -> link is dead\n");
+		dev_err(dev->dev, "NULL Frame -> link is dead\n");
 		goto sched_wq;
 	}
 
@@ -2744,7 +2738,7 @@ EXPORT_SYMBOL_GPL(pn533_finalize_setup);
 struct pn533 *pn53x_common_init(u32 device_type,
 				enum pn533_protocol_type protocol_type,
 				void *phy,
-				struct pn533_phy_ops *phy_ops,
+				const struct pn533_phy_ops *phy_ops,
 				struct pn533_frame_ops *fops,
 				struct device *dev)
 {
@@ -2799,7 +2793,7 @@ void pn53x_common_clean(struct pn533 *priv)
 	struct pn533_cmd *cmd, *n;
 
 	/* delete the timer before cleanup the worker */
-	del_timer_sync(&priv->listen_timer);
+	timer_shutdown_sync(&priv->listen_timer);
 
 	flush_delayed_work(&priv->poll_work);
 	destroy_workqueue(priv->wq);

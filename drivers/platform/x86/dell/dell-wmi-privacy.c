@@ -178,15 +178,12 @@ static ssize_t dell_privacy_current_state_show(struct device *dev,
 static DEVICE_ATTR_RO(dell_privacy_supported_type);
 static DEVICE_ATTR_RO(dell_privacy_current_state);
 
-static struct attribute *privacy_attributes[] = {
+static struct attribute *privacy_attrs[] = {
 	&dev_attr_dell_privacy_supported_type.attr,
 	&dev_attr_dell_privacy_current_state.attr,
 	NULL,
 };
-
-static const struct attribute_group privacy_attribute_group = {
-	.attrs = privacy_attributes
-};
+ATTRIBUTE_GROUPS(privacy);
 
 /*
  * Describes the Device State class exposed by BIOS which can be consumed by
@@ -291,7 +288,6 @@ static int dell_privacy_leds_setup(struct device *dev)
 	priv->cdev.max_brightness = 1;
 	priv->cdev.brightness_set_blocking = dell_privacy_micmute_led_set;
 	priv->cdev.default_trigger = "audio-micmute";
-	priv->cdev.brightness = ledtrig_audio_get(LED_AUDIO_MICMUTE);
 	return devm_led_classdev_register(dev, &priv->cdev);
 }
 
@@ -300,10 +296,6 @@ static int dell_privacy_wmi_probe(struct wmi_device *wdev, const void *context)
 	struct privacy_wmi_data *priv;
 	struct key_entry *keymap;
 	int ret, i, j;
-
-	ret = wmi_has_guid(DELL_PRIVACY_GUID);
-	if (!ret)
-		pr_debug("Unable to detect available Dell privacy devices!\n");
 
 	priv = devm_kzalloc(&wdev->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
@@ -363,10 +355,6 @@ static int dell_privacy_wmi_probe(struct wmi_device *wdev, const void *context)
 	if (ret)
 		return ret;
 
-	ret = devm_device_add_group(&wdev->dev, &privacy_attribute_group);
-	if (ret)
-		return ret;
-
 	if (priv->features_present & BIT(DELL_PRIVACY_TYPE_AUDIO)) {
 		ret = dell_privacy_leds_setup(&priv->wdev->dev);
 		if (ret)
@@ -395,6 +383,7 @@ static const struct wmi_device_id dell_wmi_privacy_wmi_id_table[] = {
 static struct wmi_driver dell_privacy_wmi_driver = {
 	.driver = {
 		.name = "dell-privacy",
+		.dev_groups = privacy_groups,
 	},
 	.probe = dell_privacy_wmi_probe,
 	.remove = dell_privacy_wmi_remove,

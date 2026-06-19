@@ -550,8 +550,7 @@ static void ts2020_regmap_unlock(void *__dev)
 	mutex_unlock(&dev->regmap_mutex);
 }
 
-static int ts2020_probe(struct i2c_client *client,
-		const struct i2c_device_id *id)
+static int ts2020_probe(struct i2c_client *client)
 {
 	struct ts2020_config *pdata = client->dev.platform_data;
 	struct dvb_frontend *fe;
@@ -702,7 +701,7 @@ err:
 	return ret;
 }
 
-static int ts2020_remove(struct i2c_client *client)
+static void ts2020_remove(struct i2c_client *client)
 {
 	struct ts2020_priv *dev = i2c_get_clientdata(client);
 
@@ -714,12 +713,11 @@ static int ts2020_remove(struct i2c_client *client)
 
 	regmap_exit(dev->regmap);
 	kfree(dev);
-	return 0;
 }
 
 static const struct i2c_device_id ts2020_id_table[] = {
-	{"ts2020", 0},
-	{"ts2022", 0},
+	{ "ts2020" },
+	{ "ts2022" },
 	{}
 };
 MODULE_DEVICE_TABLE(i2c, ts2020_id_table);

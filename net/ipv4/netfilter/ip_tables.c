@@ -14,7 +14,6 @@
 #include <linux/vmalloc.h>
 #include <linux/netdevice.h>
 #include <linux/module.h>
-#include <linux/icmp.h>
 #include <net/ip.h>
 #include <net/compat.h>
 #include <linux/uaccess.h>
@@ -31,7 +30,6 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Netfilter Core Team <coreteam@netfilter.org>");
 MODULE_DESCRIPTION("IPv4 packet filter");
-MODULE_ALIAS("ipt_icmp");
 
 void *ipt_alloc_initial_table(const struct xt_table *info)
 {
@@ -222,10 +220,11 @@ struct ipt_entry *ipt_next_entry(const struct ipt_entry *entry)
 
 /* Returns one of the generic firewall policies, like NF_ACCEPT. */
 unsigned int
-ipt_do_table(struct sk_buff *skb,
-	     const struct nf_hook_state *state,
-	     struct xt_table *table)
+ipt_do_table(void *priv,
+	     struct sk_buff *skb,
+	     const struct nf_hook_state *state)
 {
+	const struct xt_table *table = priv;
 	unsigned int hook = state->hook;
 	static const char nulldevname[IFNAMSIZ] __attribute__((aligned(sizeof(long))));
 	const struct iphdr *ip;
@@ -271,7 +270,7 @@ ipt_do_table(struct sk_buff *skb,
 	 * but it is no problem since absolute verdict is issued by these.
 	 */
 	if (static_key_false(&xt_tee_enabled))
-		jumpstack += private->stacksize * __this_cpu_read(nf_skb_duplicated);
+		jumpstack += private->stacksize * current->in_nf_duplicate;
 
 	e = get_entry(table_base, private->hook_entry[hook]);
 
@@ -982,7 +981,7 @@ static int get_info(struct net *net, void __user *user, const int *len)
 		       sizeof(info.underflow));
 		info.num_entries = private->number;
 		info.size = private->size;
-		strcpy(info.name, name);
+		strscpy(info.name, name);
 
 		if (copy_to_user(user, &info, *len) != 0)
 			ret = -EFAULT;
@@ -1705,12 +1704,10 @@ do_ipt_get_ctl(struct sock *sk, int cmd, void __user *user, int *len)
 
 static void __ipt_unregister_table(struct net *net, struct xt_table *table)
 {
-	struct xt_table_info *private;
-	void *loc_cpu_entry;
+	struct xt_table_info *private = table->private;
 	struct module *table_owner = table->me;
 	struct ipt_entry *iter;
-
-	private = xt_unregister_table(table);
+	void *loc_cpu_entry;
 
 	/* Decrease module usage counts and free resources */
 	loc_cpu_entry = private->entries;
@@ -1719,6 +1716,7 @@ static void __ipt_unregister_table(struct net *net, struct xt_table *table)
 	if (private->number > private->initial_entries)
 		module_put(table_owner);
 	xt_free_table_info(private);
+	kfree(table);
 }
 
 int ipt_register_table(struct net *net, const struct xt_table *table,
@@ -1768,7 +1766,7 @@ int ipt_register_table(struct net *net, const struct xt_table *table,
 		goto out_free;
 	}
 
-	ops = kmemdup(template_ops, sizeof(*ops) * num_ops, GFP_KERNEL);
+	ops = kmemdup_array(template_ops, num_ops, sizeof(*ops), GFP_KERNEL);
 	if (!ops) {
 		ret = -ENOMEM;
 		goto out_free;
@@ -1790,66 +1788,12 @@ out_free:
 	return ret;
 }
 
-void ipt_unregister_table_pre_exit(struct net *net, const char *name)
-{
-	struct xt_table *table = xt_find_table(net, NFPROTO_IPV4, name);
-
-	if (table)
-		nf_unregister_net_hooks(net, table->ops, hweight32(table->valid_hooks));
-}
-
 void ipt_unregister_table_exit(struct net *net, const char *name)
 {
-	struct xt_table *table = xt_find_table(net, NFPROTO_IPV4, name);
+	struct xt_table *table = xt_unregister_table_exit(net, NFPROTO_IPV4, name);
 
 	if (table)
 		__ipt_unregister_table(net, table);
-}
-
-/* Returns 1 if the type and code is matched by the range, 0 otherwise */
-static inline bool
-icmp_type_code_match(u_int8_t test_type, u_int8_t min_code, u_int8_t max_code,
-		     u_int8_t type, u_int8_t code,
-		     bool invert)
-{
-	return ((test_type == 0xFF) ||
-		(type == test_type && code >= min_code && code <= max_code))
-		^ invert;
-}
-
-static bool
-icmp_match(const struct sk_buff *skb, struct xt_action_param *par)
-{
-	const struct icmphdr *ic;
-	struct icmphdr _icmph;
-	const struct ipt_icmp *icmpinfo = par->matchinfo;
-
-	/* Must not be a fragment. */
-	if (par->fragoff != 0)
-		return false;
-
-	ic = skb_header_pointer(skb, par->thoff, sizeof(_icmph), &_icmph);
-	if (ic == NULL) {
-		/* We've been asked to examine this packet, and we
-		 * can't.  Hence, no choice but to drop.
-		 */
-		par->hotdrop = true;
-		return false;
-	}
-
-	return icmp_type_code_match(icmpinfo->type,
-				    icmpinfo->code[0],
-				    icmpinfo->code[1],
-				    ic->type, ic->code,
-				    !!(icmpinfo->invflags&IPT_ICMP_INV));
-}
-
-static int icmp_checkentry(const struct xt_mtchk_param *par)
-{
-	const struct ipt_icmp *icmpinfo = par->matchinfo;
-
-	/* Must specify no unknown invflags */
-	return (icmpinfo->invflags & ~IPT_ICMP_INV) ? -EINVAL : 0;
 }
 
 static struct xt_target ipt_builtin_tg[] __read_mostly = {
@@ -1882,18 +1826,6 @@ static struct nf_sockopt_ops ipt_sockopts = {
 	.owner		= THIS_MODULE,
 };
 
-static struct xt_match ipt_builtin_mt[] __read_mostly = {
-	{
-		.name       = "icmp",
-		.match      = icmp_match,
-		.matchsize  = sizeof(struct ipt_icmp),
-		.checkentry = icmp_checkentry,
-		.proto      = IPPROTO_ICMP,
-		.family     = NFPROTO_IPV4,
-		.me	    = THIS_MODULE,
-	},
-};
-
 static int __net_init ip_tables_net_init(struct net *net)
 {
 	return xt_proto_init(net, NFPROTO_IPV4);
@@ -1921,19 +1853,14 @@ static int __init ip_tables_init(void)
 	ret = xt_register_targets(ipt_builtin_tg, ARRAY_SIZE(ipt_builtin_tg));
 	if (ret < 0)
 		goto err2;
-	ret = xt_register_matches(ipt_builtin_mt, ARRAY_SIZE(ipt_builtin_mt));
-	if (ret < 0)
-		goto err4;
 
 	/* Register setsockopt */
 	ret = nf_register_sockopt(&ipt_sockopts);
 	if (ret < 0)
-		goto err5;
+		goto err4;
 
 	return 0;
 
-err5:
-	xt_unregister_matches(ipt_builtin_mt, ARRAY_SIZE(ipt_builtin_mt));
 err4:
 	xt_unregister_targets(ipt_builtin_tg, ARRAY_SIZE(ipt_builtin_tg));
 err2:
@@ -1946,13 +1873,11 @@ static void __exit ip_tables_fini(void)
 {
 	nf_unregister_sockopt(&ipt_sockopts);
 
-	xt_unregister_matches(ipt_builtin_mt, ARRAY_SIZE(ipt_builtin_mt));
 	xt_unregister_targets(ipt_builtin_tg, ARRAY_SIZE(ipt_builtin_tg));
 	unregister_pernet_subsys(&ip_tables_net_ops);
 }
 
 EXPORT_SYMBOL(ipt_register_table);
-EXPORT_SYMBOL(ipt_unregister_table_pre_exit);
 EXPORT_SYMBOL(ipt_unregister_table_exit);
 EXPORT_SYMBOL(ipt_do_table);
 module_init(ip_tables_init);

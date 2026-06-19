@@ -8,6 +8,7 @@
  *     Jasper St. Pierre <jstpierre@mecheye.net>
  */
 
+#include <linux/aperture.h>
 #include <linux/component.h>
 #include <linux/module.h>
 #include <linux/of_graph.h>
@@ -15,13 +16,14 @@
 #include <linux/platform_device.h>
 #include <linux/soc/amlogic/meson-canvas.h>
 
-#include <drm/drm_aperture.h>
+#include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_drv.h>
-#include <drm/drm_fb_helper.h>
-#include <drm/drm_gem_cma_helper.h>
+#include <drm/drm_fbdev_dma.h>
+#include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_modeset_helper_vtables.h>
+#include <drm/drm_module.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -31,8 +33,9 @@
 #include "meson_plane.h"
 #include "meson_osd_afbcd.h"
 #include "meson_registers.h"
-#include "meson_venc_cvbs.h"
+#include "meson_encoder_cvbs.h"
 #include "meson_encoder_hdmi.h"
+#include "meson_encoder_dsi.h"
 #include "meson_viu.h"
 #include "meson_vpp.h"
 #include "meson_rdma.h"
@@ -86,22 +89,22 @@ static int meson_dumb_create(struct drm_file *file, struct drm_device *dev,
 	args->pitch = ALIGN(DIV_ROUND_UP(args->width * args->bpp, 8), SZ_64);
 	args->size = PAGE_ALIGN(args->pitch * args->height);
 
-	return drm_gem_cma_dumb_create_internal(file, dev, args);
+	return drm_gem_dma_dumb_create_internal(file, dev, args);
 }
 
-DEFINE_DRM_GEM_CMA_FOPS(fops);
+DEFINE_DRM_GEM_DMA_FOPS(fops);
 
 static const struct drm_driver meson_driver = {
 	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
 
-	/* CMA Ops */
-	DRM_GEM_CMA_DRIVER_OPS_WITH_DUMB_CREATE(meson_dumb_create),
+	/* DMA Ops */
+	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(meson_dumb_create),
+	DRM_FBDEV_DMA_DRIVER_OPS,
 
 	/* Misc */
 	.fops			= &fops,
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
-	.date			= "20161109",
 	.major			= 1,
 	.minor			= 0,
 };
@@ -124,7 +127,7 @@ static bool meson_vpu_has_available_connectors(struct device *dev)
 	return false;
 }
 
-static struct regmap_config meson_regmap_config = {
+static const struct regmap_config meson_regmap_config = {
 	.reg_bits       = 32,
 	.val_bits       = 32,
 	.reg_stride     = 4,
@@ -170,7 +173,7 @@ static const struct meson_drm_soc_attr meson_drm_soc_attrs[] = {
 		},
 		.attrs = (const struct soc_device_attribute []) {
 			{ .soc_id = "GXL (S805*)", },
-			{ /* sentinel */ },
+			{ /* sentinel */ }
 		}
 	},
 };
@@ -275,7 +278,7 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
 	 * Remove early framebuffers (ie. simplefb). The framebuffer can be
 	 * located anywhere in RAM
 	 */
-	ret = drm_aperture_remove_framebuffers(false, &meson_driver);
+	ret = aperture_remove_all_conflicting_devices(meson_driver.name);
 	if (ret)
 		goto free_canvas_vd1_2;
 
@@ -301,37 +304,45 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
 
 	/* Encoder Initialization */
 
-	ret = meson_venc_cvbs_create(priv);
+	ret = meson_encoder_cvbs_probe(priv);
 	if (ret)
 		goto exit_afbcd;
 
 	if (has_components) {
-		ret = component_bind_all(drm->dev, drm);
+		ret = component_bind_all(dev, drm);
 		if (ret) {
 			dev_err(drm->dev, "Couldn't bind all components\n");
+			/* Do not try to unbind */
+			has_components = false;
 			goto exit_afbcd;
 		}
 	}
 
-	ret = meson_encoder_hdmi_init(priv);
+	ret = meson_encoder_hdmi_probe(priv);
 	if (ret)
-		goto unbind_all;
+		goto exit_afbcd;
+
+	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
+		ret = meson_encoder_dsi_probe(priv);
+		if (ret)
+			goto exit_afbcd;
+	}
 
 	ret = meson_plane_create(priv);
 	if (ret)
-		goto unbind_all;
+		goto exit_afbcd;
 
 	ret = meson_overlay_create(priv);
 	if (ret)
-		goto unbind_all;
+		goto exit_afbcd;
 
 	ret = meson_crtc_create(priv);
 	if (ret)
-		goto unbind_all;
+		goto exit_afbcd;
 
 	ret = request_irq(priv->vsync_irq, meson_irq, 0, drm->driver->name, drm);
 	if (ret)
-		goto unbind_all;
+		goto exit_afbcd;
 
 	drm_mode_config_reset(drm);
 
@@ -343,15 +354,12 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
 	if (ret)
 		goto uninstall_irq;
 
-	drm_fbdev_generic_setup(drm, 32);
+	drm_client_setup(drm, NULL);
 
 	return 0;
 
 uninstall_irq:
 	free_irq(priv->vsync_irq, drm);
-unbind_all:
-	if (has_components)
-		component_unbind_all(drm->dev, drm);
 exit_afbcd:
 	if (priv->afbcd.ops)
 		priv->afbcd.ops->exit(priv);
@@ -365,6 +373,13 @@ free_canvas_osd1:
 	meson_canvas_free(priv->canvas, priv->canvas_id_osd1);
 free_drm:
 	drm_dev_put(drm);
+
+	meson_encoder_dsi_remove(priv);
+	meson_encoder_hdmi_remove(priv);
+	meson_encoder_cvbs_remove(priv);
+
+	if (has_components)
+		component_unbind_all(dev, drm);
 
 	return ret;
 }
@@ -391,6 +406,11 @@ static void meson_drv_unbind(struct device *dev)
 	drm_atomic_helper_shutdown(drm);
 	free_irq(priv->vsync_irq, drm);
 	drm_dev_put(drm);
+
+	meson_encoder_dsi_remove(priv);
+	meson_encoder_hdmi_remove(priv);
+	meson_encoder_cvbs_remove(priv);
+
 	component_unbind_all(dev, drm);
 
 	if (priv->afbcd.ops)
@@ -429,54 +449,6 @@ static int __maybe_unused meson_drv_pm_resume(struct device *dev)
 	return drm_mode_config_helper_resume(priv->drm);
 }
 
-static int compare_of(struct device *dev, void *data)
-{
-	DRM_DEBUG_DRIVER("Comparing of node %pOF with %pOF\n",
-			 dev->of_node, data);
-
-	return dev->of_node == data;
-}
-
-/* Possible connectors nodes to ignore */
-static const struct of_device_id connectors_match[] = {
-	{ .compatible = "composite-video-connector" },
-	{ .compatible = "svideo-connector" },
-	{ .compatible = "hdmi-connector" },
-	{ .compatible = "dvi-connector" },
-	{}
-};
-
-static int meson_probe_remote(struct platform_device *pdev,
-			      struct component_match **match,
-			      struct device_node *parent,
-			      struct device_node *remote)
-{
-	struct device_node *ep, *remote_node;
-	int count = 1;
-
-	/* If node is a connector, return and do not add to match table */
-	if (of_match_node(connectors_match, remote))
-		return 1;
-
-	component_match_add(&pdev->dev, match, compare_of, remote);
-
-	for_each_endpoint_of_node(remote, ep) {
-		remote_node = of_graph_get_remote_port_parent(ep);
-		if (!remote_node ||
-		    remote_node == parent || /* Ignore parent endpoint */
-		    !of_device_is_available(remote_node)) {
-			of_node_put(remote_node);
-			continue;
-		}
-
-		count += meson_probe_remote(pdev, match, remote, remote_node);
-
-		of_node_put(remote_node);
-	}
-
-	return count;
-}
-
 static void meson_drv_shutdown(struct platform_device *pdev)
 {
 	struct meson_drm *priv = dev_get_drvdata(&pdev->dev);
@@ -487,6 +459,20 @@ static void meson_drv_shutdown(struct platform_device *pdev)
 	drm_kms_helper_poll_fini(priv->drm);
 	drm_atomic_helper_shutdown(priv->drm);
 }
+
+/*
+ * Only devices to use as components
+ * TOFIX: get rid of components when we can finally
+ * get meson_dx_hdmi to stop using the meson_drm
+ * private structure for HHI registers.
+ */
+static const struct of_device_id components_dev_match[] = {
+	{ .compatible = "amlogic,meson-gxbb-dw-hdmi" },
+	{ .compatible = "amlogic,meson-gxl-dw-hdmi" },
+	{ .compatible = "amlogic,meson-gxm-dw-hdmi" },
+	{ .compatible = "amlogic,meson-g12a-dw-hdmi" },
+	{}
+};
 
 static int meson_drv_probe(struct platform_device *pdev)
 {
@@ -502,8 +488,16 @@ static int meson_drv_probe(struct platform_device *pdev)
 			continue;
 		}
 
-		count += meson_probe_remote(pdev, &match, np, remote);
+		if (of_match_node(components_dev_match, remote)) {
+			component_match_add(&pdev->dev, &match, component_compare_of, remote);
+
+			dev_dbg(&pdev->dev, "parent %pOF remote match add %pOF parent %s\n",
+				np, remote, dev_name(&pdev->dev));
+		}
+
 		of_node_put(remote);
+
+		++count;
 	}
 
 	if (count && !match)
@@ -522,11 +516,9 @@ static int meson_drv_probe(struct platform_device *pdev)
 	return 0;
 };
 
-static int meson_drv_remove(struct platform_device *pdev)
+static void meson_drv_remove(struct platform_device *pdev)
 {
 	component_master_del(&pdev->dev, &meson_drv_master_ops);
-
-	return 0;
 }
 
 static struct meson_drm_match_data meson_drm_gxbb_data = {
@@ -575,7 +567,7 @@ static struct platform_driver meson_drm_platform_driver = {
 	},
 };
 
-module_platform_driver(meson_drm_platform_driver);
+drm_module_platform_driver(meson_drm_platform_driver);
 
 MODULE_AUTHOR("Jasper St. Pierre <jstpierre@mecheye.net>");
 MODULE_AUTHOR("Neil Armstrong <narmstrong@baylibre.com>");

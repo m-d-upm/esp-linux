@@ -39,11 +39,12 @@ struct uvc_buffer {
 	unsigned int offset;
 	unsigned int length;
 	unsigned int bytesused;
+	/* req_payload_size: only used with isoc */
+	unsigned int req_payload_size;
 };
 
 #define UVC_QUEUE_DISCONNECTED		(1 << 0)
 #define UVC_QUEUE_DROP_INCOMPLETE	(1 << 1)
-#define UVC_QUEUE_PAUSED		(1 << 2)
 
 struct uvc_video_queue {
 	struct vb2_queue queue;

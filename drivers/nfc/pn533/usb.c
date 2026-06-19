@@ -254,7 +254,6 @@ struct pn533_acr122_ccid_hdr {
 	 * byte for reposnse msg
 	 */
 	u8 params[3];
-	u8 data[]; /* payload */
 } __packed;
 
 struct pn533_acr122_apdu_hdr {
@@ -468,7 +467,7 @@ static void pn533_ack_complete(struct urb *urb)
 	}
 }
 
-static struct pn533_phy_ops usb_phy_ops = {
+static const struct pn533_phy_ops usb_phy_ops = {
 	.send_frame = pn533_usb_send_frame,
 	.send_ack = pn533_usb_send_ack,
 	.abort_cmd = pn533_usb_abort_cmd,
@@ -629,6 +628,7 @@ static void pn533_usb_disconnect(struct usb_interface *interface)
 	usb_free_urb(phy->out_urb);
 	usb_free_urb(phy->ack_urb);
 	kfree(phy->ack_buffer);
+	usb_put_dev(phy->udev);
 
 	nfc_info(&interface->dev, "NXP PN533 NFC device disconnected\n");
 }

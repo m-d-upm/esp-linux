@@ -14,26 +14,63 @@
 #include <linux/socket.h>
 #include <linux/types.h>
 #include <linux/compiler.h> /* __aligned */
+#include <net/genetlink.h>
 #include <net/sock.h>
 
 #include "smc_ib.h"
 
 #define SMC_V1		1		/* SMC version V1 */
 #define SMC_V2		2		/* SMC version V2 */
-#define SMC_RELEASE	0
+
+#define SMC_RELEASE_0 0
+#define SMC_RELEASE_1 1
+#define SMC_RELEASE	SMC_RELEASE_1 /* the latest release version */
 
 #define SMCPROTO_SMC		0	/* SMC protocol, IPv4 */
 #define SMCPROTO_SMC6		1	/* SMC protocol, IPv6 */
 
-#define SMC_MAX_ISM_DEVS	8	/* max # of proposed non-native ISM
-					 * devices
-					 */
-
-#define SMC_MAX_HOSTNAME_LEN	32
-#define SMC_MAX_EID_LEN		32
+#define SMC_AUTOCORKING_DEFAULT_SIZE	0x10000	/* 64K by default */
 
 extern struct proto smc_proto;
 extern struct proto smc_proto6;
+
+extern struct smc_hashinfo smc_v4_hashinfo;
+extern struct smc_hashinfo smc_v6_hashinfo;
+
+int smc_hash_sk(struct sock *sk);
+void smc_unhash_sk(struct sock *sk);
+void smc_release_cb(struct sock *sk);
+
+int smc_release(struct socket *sock);
+int smc_bind(struct socket *sock, struct sockaddr *uaddr,
+	     int addr_len);
+int smc_connect(struct socket *sock, struct sockaddr *addr,
+		int alen, int flags);
+int smc_accept(struct socket *sock, struct socket *new_sock,
+	       struct proto_accept_arg *arg);
+int smc_getname(struct socket *sock, struct sockaddr *addr,
+		int peer);
+__poll_t smc_poll(struct file *file, struct socket *sock,
+		  poll_table *wait);
+int smc_ioctl(struct socket *sock, unsigned int cmd,
+	      unsigned long arg);
+int smc_listen(struct socket *sock, int backlog);
+int smc_shutdown(struct socket *sock, int how);
+int smc_setsockopt(struct socket *sock, int level, int optname,
+		   sockptr_t optval, unsigned int optlen);
+int smc_getsockopt(struct socket *sock, int level, int optname,
+		   char __user *optval, int __user *optlen);
+int smc_sendmsg(struct socket *sock, struct msghdr *msg, size_t len);
+int smc_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
+		int flags);
+ssize_t smc_splice_read(struct socket *sock, loff_t *ppos,
+			struct pipe_inode_info *pipe, size_t len,
+			unsigned int flags);
+
+/* smc sock initialization */
+void smc_sk_init(struct net *net, struct sock *sk, int protocol);
+/* clcsock initialization */
+int smc_create_clcsk(struct net *net, struct sock *sk, int family);
 
 #ifdef ATOMIC64_INIT
 #define KERNEL_HAS_ATOMIC64
@@ -56,10 +93,30 @@ enum smc_state {		/* possible states of an SMC socket */
 	SMC_PROCESSABORT	= 27,
 };
 
+enum smc_supplemental_features {
+	SMC_SPF_EMULATED_ISM_DEV	= 0,
+};
+
+#define SMC_FEATURE_MASK \
+	(BIT(SMC_SPF_EMULATED_ISM_DEV))
+
 struct smc_link_group;
 
 struct smc_wr_rx_hdr {	/* common prefix part of LLC and CDC to demultiplex */
-	u8			type;
+	union {
+		u8 type;
+#if defined(__BIG_ENDIAN_BITFIELD)
+		struct {
+			u8 llc_version:4,
+			   llc_type:4;
+		};
+#elif defined(__LITTLE_ENDIAN_BITFIELD)
+		struct {
+			u8 llc_type:4,
+			   llc_version:4;
+		};
+#endif
+	};
 } __aligned(1);
 
 struct smc_cdc_conn_state_flags {
@@ -149,7 +206,7 @@ struct smc_connection {
 
 	struct smc_buf_desc	*sndbuf_desc;	/* send buffer descriptor */
 	struct smc_buf_desc	*rmb_desc;	/* RMBE descriptor */
-	int			rmbe_size_short;/* compressed notation */
+	int                     rmbe_size_comp; /* compressed notation */
 	int			rmbe_update_limit;
 						/* lower limit for consumer
 						 * cursor update
@@ -200,6 +257,10 @@ struct smc_connection {
 						 * data still pending
 						 */
 	char			urg_rx_byte;	/* urgent byte */
+	bool			tx_in_release_sock;
+						/* flush pending tx data in
+						 * sock release_cb()
+						 */
 	atomic_t		bytes_to_rcv;	/* arrived data,
 						 * not yet received
 						 */
@@ -217,11 +278,15 @@ struct smc_connection {
 						 */
 	u64			peer_token;	/* SMC-D token of peer */
 	u8			killed : 1;	/* abnormal termination */
+	u8			freed : 1;	/* normal termination */
 	u8			out_of_sync : 1; /* out of sync with peer */
 };
 
 struct smc_sock {				/* smc sock container */
-	struct sock		sk;
+	union {
+		struct sock		sk;
+		struct inet_sock	icsk_inet;
+	};
 	struct socket		*clcsock;	/* internal tcp socket */
 	void			(*clcsk_state_change)(struct sock *sk);
 						/* original stat_change fct. */
@@ -238,6 +303,7 @@ struct smc_sock {				/* smc sock container */
 	struct work_struct	smc_listen_work;/* prepare new accept socket */
 	struct list_head	accept_q;	/* sockets to be accepted */
 	spinlock_t		accept_q_lock;	/* protects accept_q */
+	bool			limit_smc_hs;	/* put constraint on handshake */
 	bool			use_fallback;	/* fallback to tcp */
 	int			fallback_rsn;	/* reason for fallback */
 	u32			peer_diagnosis; /* decline reason from peer */
@@ -264,15 +330,46 @@ struct smc_sock {				/* smc sock container */
 						 * */
 };
 
-static inline struct smc_sock *smc_sk(const struct sock *sk)
+#define smc_sk(ptr) container_of_const(ptr, struct smc_sock, sk)
+
+static inline void smc_init_saved_callbacks(struct smc_sock *smc)
 {
-	return (struct smc_sock *)sk;
+	smc->clcsk_state_change	= NULL;
+	smc->clcsk_data_ready	= NULL;
+	smc->clcsk_write_space	= NULL;
+	smc->clcsk_error_report	= NULL;
 }
 
 static inline struct smc_sock *smc_clcsock_user_data(const struct sock *clcsk)
 {
 	return (struct smc_sock *)
 	       ((uintptr_t)clcsk->sk_user_data & ~SK_USER_DATA_NOCOPY);
+}
+
+static inline struct smc_sock *smc_clcsock_user_data_rcu(const struct sock *clcsk)
+{
+	return (struct smc_sock *)rcu_dereference_sk_user_data(clcsk);
+}
+
+/* save target_cb in saved_cb, and replace target_cb with new_cb */
+static inline void smc_clcsock_replace_cb(void (**target_cb)(struct sock *),
+					  void (*new_cb)(struct sock *),
+					  void (**saved_cb)(struct sock *))
+{
+	/* only save once */
+	if (!*saved_cb)
+		*saved_cb = *target_cb;
+	*target_cb = new_cb;
+}
+
+/* restore target_cb to saved_cb, and reset saved_cb to NULL */
+static inline void smc_clcsock_restore_cb(void (**target_cb)(struct sock *),
+					  void (**saved_cb)(struct sock *))
+{
+	if (!*saved_cb)
+		return;
+	*target_cb = *saved_cb;
+	*saved_cb = NULL;
 }
 
 extern struct workqueue_struct	*smc_hs_wq;	/* wq for handshake work */
@@ -316,8 +413,18 @@ static inline bool using_ipsec(struct smc_sock *smc)
 }
 #endif
 
+struct smc_gidlist;
+
 struct sock *smc_accept_dequeue(struct sock *parent, struct socket *new_sock);
 void smc_close_non_accepted(struct sock *sk);
+void smc_fill_gid_list(struct smc_link_group *lgr,
+		       struct smc_gidlist *gidlist,
+		       struct smc_ib_device *known_dev, u8 *known_gid);
+
+/* smc handshake limitation interface for netlink  */
+int smc_nl_dump_hs_limitation(struct sk_buff *skb, struct netlink_callback *cb);
+int smc_nl_enable_hs_limitation(struct sk_buff *skb, struct genl_info *info);
+int smc_nl_disable_hs_limitation(struct sk_buff *skb, struct genl_info *info);
 
 static inline void smc_sock_set_flag(struct sock *sk, enum sock_flags flag)
 {

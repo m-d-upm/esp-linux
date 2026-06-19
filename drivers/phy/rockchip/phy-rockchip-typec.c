@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (C) Fuzhou Rockchip Electronics Co.Ltd
+ * Copyright (C) Rockchip Electronics Co., Ltd.
  * Author: Chris Zhong <zyw@rock-chips.com>
  *         Kever Yang <kever.yang@rock-chips.com>
  *
@@ -1104,25 +1104,22 @@ static int rockchip_typec_phy_probe(struct platform_device *pdev)
 	struct phy_provider *phy_provider;
 	struct resource *res;
 	const struct rockchip_usb3phy_port_cfg *phy_cfgs;
-	const struct of_device_id *match;
 	int index, ret;
 
 	tcphy = devm_kzalloc(dev, sizeof(*tcphy), GFP_KERNEL);
 	if (!tcphy)
 		return -ENOMEM;
 
-	match = of_match_device(dev->driver->of_match_table, dev);
-	if (!match || !match->data) {
+	phy_cfgs = of_device_get_match_data(dev);
+	if (!phy_cfgs) {
 		dev_err(dev, "phy configs are not assigned!\n");
 		return -EINVAL;
 	}
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	tcphy->base = devm_ioremap_resource(dev, res);
+	tcphy->base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(tcphy->base))
 		return PTR_ERR(tcphy->base);
 
-	phy_cfgs = match->data;
 	/* find out a proper config which can be matched with dt. */
 	index = 0;
 	while (phy_cfgs[index].reg) {
@@ -1196,11 +1193,9 @@ static int rockchip_typec_phy_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int rockchip_typec_phy_remove(struct platform_device *pdev)
+static void rockchip_typec_phy_remove(struct platform_device *pdev)
 {
 	pm_runtime_disable(&pdev->dev);
-
-	return 0;
 }
 
 static const struct of_device_id rockchip_typec_phy_dt_ids[] = {

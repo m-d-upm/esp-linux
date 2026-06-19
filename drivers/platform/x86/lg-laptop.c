@@ -8,6 +8,10 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/acpi.h>
+#include <linux/bitfield.h>
+#include <linux/bits.h>
+#include <linux/device.h>
+#include <linux/dev_printk.h>
 #include <linux/dmi.h>
 #include <linux/input.h>
 #include <linux/input/sparse-keymap.h>
@@ -16,6 +20,8 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/types.h>
+
+#include <acpi/battery.h>
 
 #define LED_DEVICE(_name, max, flag) struct led_classdev _name = { \
 	.name           = __stringify(_name),   \
@@ -28,6 +34,26 @@
 MODULE_AUTHOR("Matan Ziv-Av");
 MODULE_DESCRIPTION("LG WMI Hotkey Driver");
 MODULE_LICENSE("GPL");
+
+static bool fw_debug;
+module_param(fw_debug, bool, 0);
+MODULE_PARM_DESC(fw_debug, "Enable printing of firmware debug messages");
+
+#define LG_ADDRESS_SPACE_ID			0x8F
+
+#define LG_ADDRESS_SPACE_DEBUG_FLAG_ADR		0x00
+#define LG_ADDRESS_SPACE_FAN_MODE_ADR		0x03
+
+#define LG_ADDRESS_SPACE_DTTM_FLAG_ADR		0x20
+#define LG_ADDRESS_SPACE_CPU_TEMP_ADR		0x21
+#define LG_ADDRESS_SPACE_CPU_TRIP_LOW_ADR	0x22
+#define LG_ADDRESS_SPACE_CPU_TRIP_HIGH_ADR	0x23
+#define LG_ADDRESS_SPACE_MB_TEMP_ADR		0x24
+#define LG_ADDRESS_SPACE_MB_TRIP_LOW_ADR	0x25
+#define LG_ADDRESS_SPACE_MB_TRIP_HIGH_ADR	0x26
+
+#define LG_ADDRESS_SPACE_DEBUG_MSG_START_ADR	0x3E8
+#define LG_ADDRESS_SPACE_DEBUG_MSG_END_ADR	0x5E8
 
 #define WMI_EVENT_GUID0	"E4FB94F9-7F2B-4173-AD1A-CD1D95086248"
 #define WMI_EVENT_GUID1	"023B133E-49D1-4E10-B313-698220140DC2"
@@ -50,6 +76,9 @@ MODULE_LICENSE("GPL");
 #define WMBB_USB_CHARGE 0x10B
 #define WMBB_BATT_LIMIT 0x10C
 
+#define FAN_MODE_LOWER GENMASK(1, 0)
+#define FAN_MODE_UPPER GENMASK(5, 4)
+
 #define PLATFORM_NAME   "lg-laptop"
 
 MODULE_ALIAS("wmi:" WMI_EVENT_GUID0);
@@ -58,7 +87,6 @@ MODULE_ALIAS("wmi:" WMI_EVENT_GUID2);
 MODULE_ALIAS("wmi:" WMI_EVENT_GUID3);
 MODULE_ALIAS("wmi:" WMI_METHOD_WMAB);
 MODULE_ALIAS("wmi:" WMI_METHOD_WMBB);
-MODULE_ALIAS("acpi*:LGEX0815:*");
 
 static struct platform_device *pf_device;
 static struct input_dev *wmi_input_dev;
@@ -181,21 +209,11 @@ static union acpi_object *lg_wmbb(struct device *dev, u32 method_id, u32 arg1, u
 	return (union acpi_object *)buffer.pointer;
 }
 
-static void wmi_notify(u32 value, void *context)
+static void wmi_notify(union acpi_object *obj, void *context)
 {
-	struct acpi_buffer response = { ACPI_ALLOCATE_BUFFER, NULL };
-	union acpi_object *obj;
-	acpi_status status;
 	long data = (long)context;
 
 	pr_debug("event guid %li\n", data);
-	status = wmi_get_event_data(value, &response);
-	if (ACPI_FAILURE(status)) {
-		pr_err("Bad event status 0x%x\n", status);
-		return;
-	}
-
-	obj = (union acpi_object *)response.pointer;
 	if (!obj)
 		return;
 
@@ -217,7 +235,6 @@ static void wmi_notify(u32 value, void *context)
 
 	pr_debug("Type: %i    Eventcode: 0x%llx\n", obj->type,
 		 obj->integer.value);
-	kfree(response.pointer);
 }
 
 static void wmi_input_setup(void)
@@ -261,29 +278,19 @@ static ssize_t fan_mode_store(struct device *dev,
 			      struct device_attribute *attr,
 			      const char *buffer, size_t count)
 {
-	bool value;
+	unsigned long value;
 	union acpi_object *r;
-	u32 m;
 	int ret;
 
-	ret = kstrtobool(buffer, &value);
+	ret = kstrtoul(buffer, 10, &value);
 	if (ret)
 		return ret;
+	if (value >= 3)
+		return -EINVAL;
 
-	r = lg_wmab(dev, WM_FAN_MODE, WM_GET, 0);
-	if (!r)
-		return -EIO;
-
-	if (r->type != ACPI_TYPE_INTEGER) {
-		kfree(r);
-		return -EIO;
-	}
-
-	m = r->integer.value;
-	kfree(r);
-	r = lg_wmab(dev, WM_FAN_MODE, WM_SET, (m & 0xffffff0f) | (value << 4));
-	kfree(r);
-	r = lg_wmab(dev, WM_FAN_MODE, WM_SET, (m & 0xfffffff0) | value);
+	r = lg_wmab(dev, WM_FAN_MODE, WM_SET,
+		FIELD_PREP(FAN_MODE_LOWER, value) |
+		FIELD_PREP(FAN_MODE_UPPER, value));
 	kfree(r);
 
 	return count;
@@ -292,7 +299,7 @@ static ssize_t fan_mode_store(struct device *dev,
 static ssize_t fan_mode_show(struct device *dev,
 			     struct device_attribute *attr, char *buffer)
 {
-	unsigned int status;
+	unsigned int mode;
 	union acpi_object *r;
 
 	r = lg_wmab(dev, WM_FAN_MODE, WM_GET, 0);
@@ -304,10 +311,10 @@ static ssize_t fan_mode_show(struct device *dev,
 		return -EIO;
 	}
 
-	status = r->integer.value & 0x01;
+	mode = FIELD_GET(FAN_MODE_LOWER, r->integer.value);
 	kfree(r);
 
-	return snprintf(buffer, PAGE_SIZE, "%d\n", status);
+	return sysfs_emit(buffer, "%d\n", mode);
 }
 
 static ssize_t usb_charge_store(struct device *dev,
@@ -349,7 +356,7 @@ static ssize_t usb_charge_show(struct device *dev,
 
 	kfree(r);
 
-	return snprintf(buffer, PAGE_SIZE, "%d\n", status);
+	return sysfs_emit(buffer, "%d\n", status);
 }
 
 static ssize_t reader_mode_store(struct device *dev,
@@ -391,7 +398,7 @@ static ssize_t reader_mode_show(struct device *dev,
 
 	kfree(r);
 
-	return snprintf(buffer, PAGE_SIZE, "%d\n", status);
+	return sysfs_emit(buffer, "%d\n", status);
 }
 
 static ssize_t fn_lock_store(struct device *dev,
@@ -432,17 +439,17 @@ static ssize_t fn_lock_show(struct device *dev,
 	status = !!r->buffer.pointer[0];
 	kfree(r);
 
-	return snprintf(buffer, PAGE_SIZE, "%d\n", status);
+	return sysfs_emit(buffer, "%d\n", status);
 }
 
-static ssize_t battery_care_limit_store(struct device *dev,
-					struct device_attribute *attr,
-					const char *buffer, size_t count)
+static ssize_t charge_control_end_threshold_store(struct device *dev,
+						  struct device_attribute *attr,
+						  const char *buf, size_t count)
 {
 	unsigned long value;
 	int ret;
 
-	ret = kstrtoul(buffer, 10, &value);
+	ret = kstrtoul(buf, 10, &value);
 	if (ret)
 		return ret;
 
@@ -463,9 +470,9 @@ static ssize_t battery_care_limit_store(struct device *dev,
 	return -EINVAL;
 }
 
-static ssize_t battery_care_limit_show(struct device *dev,
-				       struct device_attribute *attr,
-				       char *buffer)
+static ssize_t charge_control_end_threshold_show(struct device *device,
+						 struct device_attribute *attr,
+						 char *buf)
 {
 	unsigned int status;
 	union acpi_object *r;
@@ -497,14 +504,51 @@ static ssize_t battery_care_limit_show(struct device *dev,
 	if (status != 80 && status != 100)
 		status = 0;
 
-	return snprintf(buffer, PAGE_SIZE, "%d\n", status);
+	return sysfs_emit(buf, "%d\n", status);
+}
+
+static ssize_t battery_care_limit_show(struct device *dev,
+				       struct device_attribute *attr,
+				       char *buffer)
+{
+	return charge_control_end_threshold_show(dev, attr, buffer);
+}
+
+static ssize_t battery_care_limit_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buffer, size_t count)
+{
+	return charge_control_end_threshold_store(dev, attr, buffer, count);
 }
 
 static DEVICE_ATTR_RW(fan_mode);
 static DEVICE_ATTR_RW(usb_charge);
 static DEVICE_ATTR_RW(reader_mode);
 static DEVICE_ATTR_RW(fn_lock);
+static DEVICE_ATTR_RW(charge_control_end_threshold);
 static DEVICE_ATTR_RW(battery_care_limit);
+
+static int lg_battery_add(struct power_supply *battery, struct acpi_battery_hook *hook)
+{
+	if (device_create_file(&battery->dev,
+			       &dev_attr_charge_control_end_threshold))
+		return -ENODEV;
+
+	return 0;
+}
+
+static int lg_battery_remove(struct power_supply *battery, struct acpi_battery_hook *hook)
+{
+	device_remove_file(&battery->dev,
+			   &dev_attr_charge_control_end_threshold);
+	return 0;
+}
+
+static struct acpi_battery_hook battery_hook = {
+	.add_battery = lg_battery_add,
+	.remove_battery = lg_battery_remove,
+	.name = "LG Battery Extension",
+};
 
 static struct attribute *dev_attributes[] = {
 	&dev_attr_fan_mode.attr,
@@ -608,6 +652,107 @@ static struct platform_driver pf_driver = {
 	}
 };
 
+static acpi_status lg_laptop_address_space_write(struct device *dev, acpi_physical_address address,
+						 size_t size, u64 value)
+{
+	u8 byte;
+
+	/* Ignore any debug messages */
+	if (address >= LG_ADDRESS_SPACE_DEBUG_MSG_START_ADR &&
+	    address <= LG_ADDRESS_SPACE_DEBUG_MSG_END_ADR)
+		return AE_OK;
+
+	if (size != sizeof(byte))
+		return AE_BAD_PARAMETER;
+
+	byte = value & 0xFF;
+
+	switch (address) {
+	case LG_ADDRESS_SPACE_FAN_MODE_ADR:
+		/*
+		 * The fan mode field is not affected by the DTTM flag, so we
+		 * have to manually check fw_debug.
+		 */
+		if (fw_debug)
+			dev_dbg(dev, "Fan mode set to mode %u\n", byte);
+
+		return AE_OK;
+	case LG_ADDRESS_SPACE_CPU_TEMP_ADR:
+		dev_dbg(dev, "CPU temperature is %u °C\n", byte);
+		return AE_OK;
+	case LG_ADDRESS_SPACE_CPU_TRIP_LOW_ADR:
+		dev_dbg(dev, "CPU lower trip point set to %u °C\n", byte);
+		return AE_OK;
+	case LG_ADDRESS_SPACE_CPU_TRIP_HIGH_ADR:
+		dev_dbg(dev, "CPU higher trip point set to %u °C\n", byte);
+		return AE_OK;
+	case LG_ADDRESS_SPACE_MB_TEMP_ADR:
+		dev_dbg(dev, "Motherboard temperature is %u °C\n", byte);
+		return AE_OK;
+	case LG_ADDRESS_SPACE_MB_TRIP_LOW_ADR:
+		dev_dbg(dev, "Motherboard lower trip point set to %u °C\n", byte);
+		return AE_OK;
+	case LG_ADDRESS_SPACE_MB_TRIP_HIGH_ADR:
+		dev_dbg(dev, "Motherboard higher trip point set to %u °C\n", byte);
+		return AE_OK;
+	default:
+		dev_notice_ratelimited(dev, "Ignoring write to unknown opregion address %llu\n",
+				       address);
+		return AE_OK;
+	}
+}
+
+static acpi_status lg_laptop_address_space_read(struct device *dev, acpi_physical_address address,
+						size_t size, u64 *value)
+{
+	if (size != 1)
+		return AE_BAD_PARAMETER;
+
+	switch (address) {
+	case LG_ADDRESS_SPACE_DEBUG_FLAG_ADR:
+		/* Debug messages are already printed using the standard ACPI Debug object */
+		*value = 0x00;
+		return AE_OK;
+	case LG_ADDRESS_SPACE_DTTM_FLAG_ADR:
+		*value = fw_debug;
+		return AE_OK;
+	default:
+		dev_notice_ratelimited(dev, "Attempt to read unknown opregion address %llu\n",
+				       address);
+		return AE_BAD_PARAMETER;
+	}
+}
+
+static acpi_status lg_laptop_address_space_handler(u32 function, acpi_physical_address address,
+						   u32 bits, u64 *value, void *handler_context,
+						   void *region_context)
+{
+	struct device *dev = handler_context;
+	size_t size;
+
+	if (bits % BITS_PER_BYTE)
+		return AE_BAD_PARAMETER;
+
+	size = bits / BITS_PER_BYTE;
+
+	switch (function) {
+	case ACPI_READ:
+		return lg_laptop_address_space_read(dev, address, size, value);
+	case ACPI_WRITE:
+		return lg_laptop_address_space_write(dev, address, size, *value);
+	default:
+		return AE_BAD_PARAMETER;
+	}
+}
+
+static void lg_laptop_remove_address_space_handler(void *data)
+{
+	struct acpi_device *device = data;
+
+	acpi_remove_address_space_handler(device->handle, LG_ADDRESS_SPACE_ID,
+					  &lg_laptop_address_space_handler);
+}
+
 static int acpi_add(struct acpi_device *device)
 {
 	struct platform_device_info pdev_info = {
@@ -615,12 +760,24 @@ static int acpi_add(struct acpi_device *device)
 		.name = PLATFORM_NAME,
 		.id = PLATFORM_DEVID_NONE,
 	};
+	acpi_status status;
 	int ret;
 	const char *product;
 	int year = 2017;
 
 	if (pf_device)
 		return 0;
+
+	status = acpi_install_address_space_handler(device->handle, LG_ADDRESS_SPACE_ID,
+						    &lg_laptop_address_space_handler,
+						    NULL, &device->dev);
+	if (ACPI_FAILURE(status))
+		return -ENODEV;
+
+	ret = devm_add_action_or_reset(&device->dev, lg_laptop_remove_address_space_handler,
+				       device);
+	if (ret < 0)
+		return ret;
 
 	ret = platform_driver_register(&pf_driver);
 	if (ret)
@@ -637,6 +794,18 @@ static int acpi_add(struct acpi_device *device)
 	if (product && strlen(product) > 4)
 		switch (product[4]) {
 		case '5':
+			if (strlen(product) > 5)
+				switch (product[5]) {
+				case 'N':
+					year = 2021;
+					break;
+				case '0':
+					year = 2016;
+					break;
+				default:
+					year = 2022;
+				}
+			break;
 		case '6':
 			year = 2016;
 			break;
@@ -679,6 +848,7 @@ static int acpi_add(struct acpi_device *device)
 	led_classdev_register(&pf_device->dev, &tpad_led);
 
 	wmi_input_setup();
+	battery_hook_register(&battery_hook);
 
 	return 0;
 
@@ -689,19 +859,18 @@ out_platform_registered:
 	return ret;
 }
 
-static int acpi_remove(struct acpi_device *device)
+static void acpi_remove(struct acpi_device *device)
 {
 	sysfs_remove_group(&pf_device->dev.kobj, &dev_attribute_group);
 
 	led_classdev_unregister(&tpad_led);
 	led_classdev_unregister(&kbd_backlight);
 
+	battery_hook_unregister(&battery_hook);
 	wmi_input_destroy();
 	platform_device_unregister(pf_device);
 	pf_device = NULL;
 	platform_driver_unregister(&pf_driver);
-
-	return 0;
 }
 
 static const struct acpi_device_id device_ids[] = {
@@ -719,7 +888,6 @@ static struct acpi_driver acpi_driver = {
 		.remove = acpi_remove,
 		.notify = acpi_notify,
 		},
-	.owner = THIS_MODULE,
 };
 
 static int __init acpi_init(void)

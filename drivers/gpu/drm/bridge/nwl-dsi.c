@@ -12,11 +12,12 @@
 #include <linux/irq.h>
 #include <linux/math64.h>
 #include <linux/mfd/syscon.h>
+#include <linux/media-bus-format.h>
 #include <linux/module.h>
 #include <linux/mux/consumer.h>
 #include <linux/of.h>
-#include <linux/of_platform.h>
 #include <linux/phy/phy.h>
+#include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
 #include <linux/sys_soc.h>
@@ -26,7 +27,6 @@
 #include <drm/drm_bridge.h>
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_of.h>
-#include <drm/drm_panel.h>
 #include <drm/drm_print.h>
 
 #include <video/mipi_display.h>
@@ -66,7 +66,6 @@ struct nwl_dsi_transfer {
 struct nwl_dsi {
 	struct drm_bridge bridge;
 	struct mipi_dsi_host dsi_host;
-	struct drm_bridge *panel_bridge;
 	struct device *dev;
 	struct phy *phy;
 	union phy_configure_opts phy_cfg;
@@ -290,13 +289,13 @@ static int nwl_dsi_config_dpi(struct nwl_dsi *dsi)
 
 	nwl_dsi_write(dsi, NWL_DSI_INTERFACE_COLOR_CODING, NWL_DSI_DPI_24_BIT);
 	nwl_dsi_write(dsi, NWL_DSI_PIXEL_FORMAT, color_format);
-	/*
-	 * Adjusting input polarity based on the video mode results in
-	 * a black screen so always pick active low:
-	 */
 	nwl_dsi_write(dsi, NWL_DSI_VSYNC_POLARITY,
+		      dsi->mode.flags & DRM_MODE_FLAG_PVSYNC ?
+		      NWL_DSI_VSYNC_POLARITY_ACTIVE_HIGH :
 		      NWL_DSI_VSYNC_POLARITY_ACTIVE_LOW);
 	nwl_dsi_write(dsi, NWL_DSI_HSYNC_POLARITY,
+		      dsi->mode.flags & DRM_MODE_FLAG_PHSYNC ?
+		      NWL_DSI_HSYNC_POLARITY_ACTIVE_HIGH :
 		      NWL_DSI_HSYNC_POLARITY_ACTIVE_LOW);
 
 	burst_mode = (dsi->dsi_mode_flags & MIPI_DSI_MODE_VIDEO_BURST) &&
@@ -333,17 +332,13 @@ static int nwl_dsi_config_dpi(struct nwl_dsi *dsi)
 
 static int nwl_dsi_init_interrupts(struct nwl_dsi *dsi)
 {
-	u32 irq_enable;
-
-	nwl_dsi_write(dsi, NWL_DSI_IRQ_MASK, 0xffffffff);
-	nwl_dsi_write(dsi, NWL_DSI_IRQ_MASK2, 0x7);
-
-	irq_enable = ~(u32)(NWL_DSI_TX_PKT_DONE_MASK |
-			    NWL_DSI_RX_PKT_HDR_RCVD_MASK |
-			    NWL_DSI_TX_FIFO_OVFLW_MASK |
-			    NWL_DSI_HS_TX_TIMEOUT_MASK);
+	u32 irq_enable = ~(u32)(NWL_DSI_TX_PKT_DONE_MASK |
+				NWL_DSI_RX_PKT_HDR_RCVD_MASK |
+				NWL_DSI_TX_FIFO_OVFLW_MASK |
+				NWL_DSI_HS_TX_TIMEOUT_MASK);
 
 	nwl_dsi_write(dsi, NWL_DSI_IRQ_MASK, irq_enable);
+	nwl_dsi_write(dsi, NWL_DSI_IRQ_MASK2, 0x7);
 
 	return nwl_dsi_clear_error(dsi);
 }
@@ -671,6 +666,12 @@ static int nwl_dsi_mode_set(struct nwl_dsi *dsi)
 		return ret;
 	}
 
+	ret = phy_set_mode(dsi->phy, PHY_MODE_MIPI_DPHY);
+	if (ret < 0) {
+		DRM_DEV_ERROR(dev, "Failed to set DSI phy mode: %d\n", ret);
+		goto uninit_phy;
+	}
+
 	ret = phy_configure(dsi->phy, phy_cfg);
 	if (ret < 0) {
 		DRM_DEV_ERROR(dev, "Failed to configure DSI phy: %d\n", ret);
@@ -735,9 +736,8 @@ static int nwl_dsi_disable(struct nwl_dsi *dsi)
 	return 0;
 }
 
-static void
-nwl_dsi_bridge_atomic_disable(struct drm_bridge *bridge,
-			      struct drm_bridge_state *old_bridge_state)
+static void nwl_dsi_bridge_atomic_disable(struct drm_bridge *bridge,
+					  struct drm_atomic_state *state)
 {
 	struct nwl_dsi *dsi = bridge_to_dsi(bridge);
 	int ret;
@@ -858,7 +858,7 @@ nwl_dsi_bridge_mode_set(struct drm_bridge *bridge,
 	/* Save the new desired phy config */
 	memcpy(&dsi->phy_cfg, &new_cfg, sizeof(new_cfg));
 
-	memcpy(&dsi->mode, adjusted_mode, sizeof(dsi->mode));
+	drm_mode_copy(&dsi->mode, adjusted_mode);
 	drm_mode_debug_printmodeline(adjusted_mode);
 
 	if (pm_runtime_resume_and_get(dev) < 0)
@@ -897,9 +897,8 @@ runtime_put:
 	pm_runtime_put_sync(dev);
 }
 
-static void
-nwl_dsi_bridge_atomic_enable(struct drm_bridge *bridge,
-			     struct drm_bridge_state *old_bridge_state)
+static void nwl_dsi_bridge_atomic_enable(struct drm_bridge *bridge,
+					 struct drm_atomic_state *state)
 {
 	struct nwl_dsi *dsi = bridge_to_dsi(bridge);
 	int ret;
@@ -911,36 +910,17 @@ nwl_dsi_bridge_atomic_enable(struct drm_bridge *bridge,
 }
 
 static int nwl_dsi_bridge_attach(struct drm_bridge *bridge,
+				 struct drm_encoder *encoder,
 				 enum drm_bridge_attach_flags flags)
 {
 	struct nwl_dsi *dsi = bridge_to_dsi(bridge);
 	struct drm_bridge *panel_bridge;
-	struct drm_panel *panel;
-	int ret;
 
-	ret = drm_of_find_panel_or_bridge(dsi->dev->of_node, 1, 0, &panel,
-					  &panel_bridge);
-	if (ret)
-		return ret;
+	panel_bridge = devm_drm_of_get_bridge(dsi->dev, dsi->dev->of_node, 1, 0);
+	if (IS_ERR(panel_bridge))
+		return PTR_ERR(panel_bridge);
 
-	if (panel) {
-		panel_bridge = drm_panel_bridge_add(panel);
-		if (IS_ERR(panel_bridge))
-			return PTR_ERR(panel_bridge);
-	}
-	dsi->panel_bridge = panel_bridge;
-
-	if (!dsi->panel_bridge)
-		return -EPROBE_DEFER;
-
-	return drm_bridge_attach(bridge->encoder, dsi->panel_bridge, bridge,
-				 flags);
-}
-
-static void nwl_dsi_bridge_detach(struct drm_bridge *bridge)
-{	struct nwl_dsi *dsi = bridge_to_dsi(bridge);
-
-	drm_of_panel_bridge_remove(dsi->dev->of_node, 1, 0);
+	return drm_bridge_attach(encoder, panel_bridge, bridge, flags);
 }
 
 static u32 *nwl_bridge_atomic_get_input_bus_fmts(struct drm_bridge *bridge,
@@ -988,7 +968,6 @@ static const struct drm_bridge_funcs nwl_dsi_bridge_funcs = {
 	.mode_set		= nwl_dsi_bridge_mode_set,
 	.mode_valid		= nwl_dsi_bridge_mode_valid,
 	.attach			= nwl_dsi_bridge_attach,
-	.detach			= nwl_dsi_bridge_detach,
 };
 
 static int nwl_dsi_parse_dt(struct nwl_dsi *dsi)
@@ -1160,7 +1139,7 @@ MODULE_DEVICE_TABLE(of, nwl_dsi_dt_ids);
 static const struct soc_device_attribute nwl_dsi_quirks_match[] = {
 	{ .soc_id = "i.MX8MQ", .revision = "2.0",
 	  .data = (void *)E11418_HS_MODE_QUIRK },
-	{ /* sentinel. */ },
+	{ /* sentinel. */ }
 };
 
 static int nwl_dsi_probe(struct platform_device *pdev)
@@ -1170,9 +1149,10 @@ static int nwl_dsi_probe(struct platform_device *pdev)
 	struct nwl_dsi *dsi;
 	int ret;
 
-	dsi = devm_kzalloc(dev, sizeof(*dsi), GFP_KERNEL);
-	if (!dsi)
-		return -ENOMEM;
+	dsi = devm_drm_bridge_alloc(dev, struct nwl_dsi, bridge,
+				    &nwl_dsi_bridge_funcs);
+	if (IS_ERR(dsi))
+		return PTR_ERR(dsi);
 
 	dsi->dev = dev;
 
@@ -1201,9 +1181,9 @@ static int nwl_dsi_probe(struct platform_device *pdev)
 		dsi->quirks = (uintptr_t)attr->data;
 
 	dsi->bridge.driver_private = dsi;
-	dsi->bridge.funcs = &nwl_dsi_bridge_funcs;
 	dsi->bridge.of_node = dev->of_node;
 	dsi->bridge.timings = &nwl_dsi_timings;
+	dsi->bridge.type = DRM_MODE_CONNECTOR_DSI;
 
 	dev_set_drvdata(dev, dsi);
 	pm_runtime_enable(dev);
@@ -1219,7 +1199,7 @@ static int nwl_dsi_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int nwl_dsi_remove(struct platform_device *pdev)
+static void nwl_dsi_remove(struct platform_device *pdev)
 {
 	struct nwl_dsi *dsi = platform_get_drvdata(pdev);
 
@@ -1227,7 +1207,6 @@ static int nwl_dsi_remove(struct platform_device *pdev)
 	mipi_dsi_host_unregister(&dsi->dsi_host);
 	drm_bridge_remove(&dsi->bridge);
 	pm_runtime_disable(&pdev->dev);
-	return 0;
 }
 
 static struct platform_driver nwl_dsi_driver = {

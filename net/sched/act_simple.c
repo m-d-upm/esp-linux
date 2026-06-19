@@ -14,6 +14,7 @@
 #include <net/netlink.h>
 #include <net/pkt_sched.h>
 #include <net/pkt_cls.h>
+#include <net/tc_wrapper.h>
 
 #include <linux/tc_act/tc_defact.h>
 #include <net/tc_act/tc_defact.h>
@@ -21,8 +22,9 @@
 static struct tc_action_ops act_simp_ops;
 
 #define SIMP_MAX_DATA	32
-static int tcf_simp_act(struct sk_buff *skb, const struct tc_action *a,
-			struct tcf_result *res)
+TC_INDIRECT_SCOPE int tcf_simp_act(struct sk_buff *skb,
+				   const struct tc_action *a,
+				   struct tcf_result *res)
 {
 	struct tcf_defact *d = to_defact(a);
 
@@ -35,7 +37,8 @@ static int tcf_simp_act(struct sk_buff *skb, const struct tc_action *a,
 	 * then it would look like "hello_3" (without quotes)
 	 */
 	pr_info("simple: %s_%llu\n",
-	       (char *)d->tcfd_defdata, d->tcf_bstats.packets);
+		(char *)d->tcfd_defdata,
+		u64_stats_read(&d->tcf_bstats.packets));
 	spin_unlock(&d->tcf_lock);
 	return d->tcf_action;
 }
@@ -69,7 +72,6 @@ static int reset_policy(struct tc_action *a, const struct nlattr *defdata,
 	d = to_defact(a);
 	spin_lock_bh(&d->tcf_lock);
 	goto_ch = tcf_action_set_ctrlact(a, p->action, goto_ch);
-	memset(d->tcfd_defdata, 0, SIMP_MAX_DATA);
 	nla_strscpy(d->tcfd_defdata, defdata, SIMP_MAX_DATA);
 	spin_unlock_bh(&d->tcf_lock);
 	if (goto_ch)
@@ -115,7 +117,7 @@ static int tcf_simp_init(struct net *net, struct nlattr *nla,
 		return err;
 	exists = err;
 	if (exists && bind)
-		return 0;
+		return ACT_P_BOUND;
 
 	if (tb[TCA_DEF_DATA] == NULL) {
 		if (exists)
@@ -196,23 +198,6 @@ nla_put_failure:
 	return -1;
 }
 
-static int tcf_simp_walker(struct net *net, struct sk_buff *skb,
-			   struct netlink_callback *cb, int type,
-			   const struct tc_action_ops *ops,
-			   struct netlink_ext_ack *extack)
-{
-	struct tc_action_net *tn = net_generic(net, act_simp_ops.net_id);
-
-	return tcf_generic_walker(tn, skb, cb, type, ops, extack);
-}
-
-static int tcf_simp_search(struct net *net, struct tc_action **a, u32 index)
-{
-	struct tc_action_net *tn = net_generic(net, act_simp_ops.net_id);
-
-	return tcf_idr_search(tn, a, index);
-}
-
 static struct tc_action_ops act_simp_ops = {
 	.kind		=	"simple",
 	.id		=	TCA_ID_SIMP,
@@ -221,10 +206,9 @@ static struct tc_action_ops act_simp_ops = {
 	.dump		=	tcf_simp_dump,
 	.cleanup	=	tcf_simp_release,
 	.init		=	tcf_simp_init,
-	.walk		=	tcf_simp_walker,
-	.lookup		=	tcf_simp_search,
 	.size		=	sizeof(struct tcf_defact),
 };
+MODULE_ALIAS_NET_ACT("simple");
 
 static __net_init int simp_init_net(struct net *net)
 {

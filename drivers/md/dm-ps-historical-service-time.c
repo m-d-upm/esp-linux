@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Historical Service Time
  *
@@ -523,6 +523,7 @@ static int hst_end_io(struct path_selector *ps, struct dm_path *path,
 static struct path_selector_type hst_ps = {
 	.name		= "historical-service-time",
 	.module		= THIS_MODULE,
+	.features	= DM_PS_USE_HR_TIMER,
 	.table_args	= 1,
 	.info_args	= 3,
 	.create		= hst_create,
@@ -552,10 +553,7 @@ static int __init dm_hst_init(void)
 
 static void __exit dm_hst_exit(void)
 {
-	int r = dm_unregister_path_selector(&hst_ps);
-
-	if (r < 0)
-		DMERR("unregister failed %d", r);
+	dm_unregister_path_selector(&hst_ps);
 }
 
 module_init(dm_hst_init);

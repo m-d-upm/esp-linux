@@ -3,36 +3,6 @@
  * core_intr.c - DesignWare HS OTG Controller common interrupt handling
  *
  * Copyright (C) 2004-2013 Synopsys, Inc.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions, and the following disclaimer,
- *    without modification.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. The names of the above-listed copyright holders may not be used
- *    to endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * ALTERNATIVELY, this software may be distributed under the terms of the
- * GNU General Public License ("GPL") as published by the Free Software
- * Foundation; either version 2 of the License, or (at your option) any
- * later version.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
- * IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
- * THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
- * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
- * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
- * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
 /*
@@ -114,6 +84,7 @@ static void dwc2_handle_otg_intr(struct dwc2_hsotg *hsotg)
 	u32 gotgint;
 	u32 gotgctl;
 	u32 gintmsk;
+	u32 pcgctl;
 
 	gotgint = dwc2_readl(hsotg, GOTGINT);
 	gotgctl = dwc2_readl(hsotg, GOTGCTL);
@@ -126,8 +97,22 @@ static void dwc2_handle_otg_intr(struct dwc2_hsotg *hsotg)
 			dwc2_op_state_str(hsotg));
 		gotgctl = dwc2_readl(hsotg, GOTGCTL);
 
-		if (dwc2_is_device_mode(hsotg))
+		if (dwc2_is_device_mode(hsotg)) {
+			if (hsotg->params.eusb2_disc) {
+				/* Clear the Gate hclk. */
+				pcgctl = dwc2_readl(hsotg, PCGCTL);
+				pcgctl &= ~PCGCTL_GATEHCLK;
+				dwc2_writel(hsotg, pcgctl, PCGCTL);
+				udelay(5);
+
+				/* Clear Phy Clock bit. */
+				pcgctl = dwc2_readl(hsotg, PCGCTL);
+				pcgctl &= ~PCGCTL_STOPPCLK;
+				dwc2_writel(hsotg, pcgctl, PCGCTL);
+				udelay(5);
+			}
 			dwc2_hsotg_disconnect(hsotg);
+		}
 
 		if (hsotg->op_state == OTG_STATE_B_HOST) {
 			hsotg->op_state = OTG_STATE_B_PERIPHERAL;
@@ -147,7 +132,7 @@ static void dwc2_handle_otg_intr(struct dwc2_hsotg *hsotg)
 			 * disconnected
 			 */
 			/* Reset to a clean state */
-			hsotg->lx_state = DWC2_L0;
+			hsotg->lx_state = DWC2_L3;
 		}
 
 		gotgctl = dwc2_readl(hsotg, GOTGCTL);
@@ -316,7 +301,7 @@ static void dwc2_handle_session_req_intr(struct dwc2_hsotg *hsotg)
 		hsotg->lx_state);
 
 	if (dwc2_is_device_mode(hsotg)) {
-		if (hsotg->lx_state == DWC2_L2) {
+		if (hsotg->lx_state != DWC2_L0) {
 			if (hsotg->in_ppd) {
 				ret = dwc2_exit_partial_power_down(hsotg, 0,
 								   true);
@@ -743,6 +728,11 @@ static inline void dwc_handle_gpwrdn_disc_det(struct dwc2_hsotg *hsotg,
 	gpwrdn_tmp = dwc2_readl(hsotg, GPWRDN);
 	gpwrdn_tmp &= ~GPWRDN_PMUINTSEL;
 	dwc2_writel(hsotg, gpwrdn_tmp, GPWRDN);
+
+	/* Reset ULPI latch */
+	gpwrdn = dwc2_readl(hsotg, GPWRDN);
+	gpwrdn &= ~GPWRDN_ULPI_LATCH_EN_DURING_HIB_ENTRY;
+	dwc2_writel(hsotg, gpwrdn, GPWRDN);
 
 	/* De-assert Wakeup Logic */
 	gpwrdn_tmp = dwc2_readl(hsotg, GPWRDN);

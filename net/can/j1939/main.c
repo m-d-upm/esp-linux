@@ -38,6 +38,10 @@ static void j1939_can_recv(struct sk_buff *iskb, void *data)
 	struct j1939_sk_buff_cb *skcb, *iskcb;
 	struct can_frame *cf;
 
+	/* make sure we only get Classical CAN frames */
+	if (!can_is_can_skb(iskb))
+		return;
+
 	/* create a copy of the skb
 	 * j1939 only delivers the real data bytes,
 	 * the header goes into sockaddr.
@@ -372,6 +376,11 @@ static int j1939_netdev_notify(struct notifier_block *nb,
 		j1939_cancel_active_session(priv, NULL);
 		j1939_sk_netdev_event_netdown(priv);
 		j1939_ecu_unmap_all(priv);
+		break;
+	case NETDEV_UNREGISTER:
+		j1939_cancel_active_session(priv, NULL);
+		j1939_sk_netdev_event_netdown(priv);
+		j1939_sk_netdev_event_unregister(priv);
 		break;
 	}
 

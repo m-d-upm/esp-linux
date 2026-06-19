@@ -23,7 +23,7 @@
 #include <linux/irq.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <scsi/libsas.h>
 #include <scsi/scsi.h>
 #include <scsi/scsi_tcq.h>
@@ -425,7 +425,6 @@ struct mvs_task_exec_info {
 void mvs_get_sas_addr(void *buf, u32 buflen);
 void mvs_iounmap(void __iomem *regs);
 int mvs_ioremap(struct mvs_info *mvi, int bar, int bar_ex);
-void mvs_phys_reset(struct mvs_info *mvi, u32 phy_mask, int hard);
 int mvs_phy_control(struct asd_sas_phy *sas_phy, enum phy_func func,
 			void *funcdata);
 void mvs_set_sas_addr(struct mvs_info *mvi, int port_id, u32 off_lo,
@@ -434,8 +433,6 @@ void mvs_scan_start(struct Scsi_Host *shost);
 int mvs_scan_finished(struct Scsi_Host *shost, unsigned long time);
 int mvs_queue_command(struct sas_task *task, gfp_t gfp_flags);
 int mvs_abort_task(struct sas_task *task);
-int mvs_abort_task_set(struct domain_device *dev, u8 *lun);
-int mvs_clear_task_set(struct domain_device *dev, u8 * lun);
 void mvs_port_formed(struct asd_sas_phy *sas_phy);
 void mvs_port_deformed(struct asd_sas_phy *sas_phy);
 int mvs_dev_found(struct domain_device *dev);

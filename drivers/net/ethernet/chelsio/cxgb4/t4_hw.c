@@ -9348,7 +9348,7 @@ int t4_init_devlog_params(struct adapter *adap)
 		return 0;
 	}
 
-	/* Otherwise, ask the firmware for it's Device Log Parameters.
+	/* Otherwise, ask the firmware for its Device Log Parameters.
 	 */
 	memset(&devlog_cmd, 0, sizeof(devlog_cmd));
 	devlog_cmd.op_to_write = cpu_to_be32(FW_CMD_OP_V(FW_DEVLOG_CMD) |
@@ -9708,7 +9708,7 @@ int t4_port_init(struct adapter *adap, int mbox, int pf, int vf)
 		if (ret)
 			return ret;
 
-		memcpy(adap->port[i]->dev_addr, addr, ETH_ALEN);
+		eth_hw_addr_set(adap->port[i], addr);
 		j++;
 	}
 	return 0;
