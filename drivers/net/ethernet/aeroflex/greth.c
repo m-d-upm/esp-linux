@@ -1401,8 +1401,6 @@ static int greth_of_probe(struct platform_device *ofdev)
 	greth->have_edcl = !!(tmp & GRETH_CTRL_EA);
 	greth->edcl = greth->have_edcl && !(tmp & GRETH_CTRL_ED);
 
-	dev_err(greth->dev, "greth->edcl = %u and greth->have_edcl = %u.\n", greth->edcl, greth->have_edcl);
-
 	if (!greth->edcl) {
 		if (netif_msg_probe(greth))
 			dev_dbg(greth->dev, "resetting controller.\n");
