@@ -9,6 +9,8 @@
 #define GRETH_MII_BUSY 0x8
 #define GRETH_MII_NVALID 0x10
 
+#define GRETH_CTRL_EA	      0x80000000
+#define GRETH_CTRL_ED	      0x4000
 #define GRETH_CTRL_FD         0x10
 #define GRETH_CTRL_PR         0x20
 #define GRETH_CTRL_SP         0x80
@@ -136,6 +138,7 @@ struct greth_private {
 	u8 gbit_mac;
 	u8 mdio_int_en;
 	u8 edcl;
+	u8 have_edcl;
 };
 
 #endif
